@@ -23,8 +23,8 @@
 #ifdef ZIMODEM_CARDPUTER
 // UART pins towards the retro computer (Grove port: G1 = RX, G2 = TX).
 // Check the pinout in the M5Stack documentation for your board.
-# define CARDPUTER_MODEM_RX 1
-# define CARDPUTER_MODEM_TX 2
+# define CARDPUTER_MODEM_RX 13
+# define CARDPUTER_MODEM_TX 15
 // Uncomment to use the control pins (DCD/CTS/RTS/RI/DSR/DTR) on the
 // pins G3,G4,G5,G6,G7,G13 of the expansion header. WARNING: check first
 // that they are free on your Cardputer revision (ADV).
