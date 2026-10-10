@@ -13,6 +13,25 @@
    See the License for the specific language governing permissions and
    limitations under the License. 
 */
+/*
+ * ===== PORT PER M5STACK CARDPUTER / CARDPUTER ADV =====
+ * Comment out the following line to return to the original behavior.
+ * It must come BEFORE any Zimodem #define (e.g. "#define null 0"),
+ * because the M5 libraries do not tolerate that macro.
+ */
+#define ZIMODEM_CARDPUTER
+#ifdef ZIMODEM_CARDPUTER
+// UART pins towards the retro computer (Grove port: G1 = RX, G2 = TX).
+// Check the pinout in the M5Stack documentation for your board.
+# define CARDPUTER_MODEM_RX 1
+# define CARDPUTER_MODEM_TX 2
+// Uncomment to use the control pins (DCD/CTS/RTS/RI/DSR/DTR) on the
+// pins G3,G4,G5,G6,G7,G13 of the expansion header. WARNING: check first
+// that they are free on your Cardputer revision (ADV).
+//# define CARDPUTER_USE_CTRL_PINS
+# include <M5Cardputer.h>
+# include "CardputerModemSerial.h"
+#endif
 //#define TCP_SND_BUF                     4 * TCP_MSS
 #define ZIMODEM_VERSION "4.0.3"
 const char compile_date[] = __DATE__ " " __TIME__;
@@ -57,6 +76,11 @@ const char compile_date[] = __DATE__ " " __TIME__;
 # undef INCLUDE_SSH
 # undef INCLUDE_SD_SHELL
 # undef INCLUDE_CBMMODEM
+#endif
+
+#ifdef ZIMODEM_CARDPUTER
+// The firmware downloaded by AT&U is the generic one: it would overwrite this port.
+# undef INCLUDE_OTH_UPDATES
 #endif
 
 #if SUPPORT_LED_PINS
@@ -107,6 +131,19 @@ const char compile_date[] = __DATE__ " " __TIME__;
 #  define DEFAULT_PIN_TXD GPIO_NUM_32
 #  define DEFAULT_PIN_RXD GPIO_NUM_33
 #  define DEFAULT_PIN_SND GPIO_NUM_4
+# elif defined(ZIMODEM_CARDPUTER)       /* Configuration for M5Stack Cardputer / Cardputer ADV */
+#  define DEFAULT_PIN_RXD CARDPUTER_MODEM_RX
+#  define DEFAULT_PIN_TXD CARDPUTER_MODEM_TX
+// Control pins: if CARDPUTER_USE_CTRL_PINS is not defined they stay inert
+// (pinSupport[] = false in setup()); the numbers only serve as valid indices.
+#  define DEFAULT_PIN_DCD GPIO_NUM_5
+#  define DEFAULT_PIN_CTS GPIO_NUM_4
+#  define DEFAULT_PIN_RTS GPIO_NUM_3
+#  define DEFAULT_PIN_RI GPIO_NUM_6
+#  define DEFAULT_PIN_DSR GPIO_NUM_7
+#  define DEFAULT_PIN_DTR GPIO_NUM_13
+#  define DEFAULT_PIN_SND -1
+#  define DEFAULT_PIN_OTH -1
 # elif defined(ARDUINO_ESP32C3_DEV)   /* Configuration for the Esp32C3 4MB Dev Board */
 #  undef INCLUDE_SD_SHELL
 #  undef PIN_FACTORY_RESET
@@ -401,7 +438,12 @@ static bool connectWifi(const char* ssid, const char* password, IPAddress *ip, I
   {
     WiFiCounter++;
     if(!amConnected)
+    {
       delay(500);
+#ifdef ZIMODEM_CARDPUTER
+      HWSerial.pump();
+#endif
+    }
     amConnected = (WiFi.status() == WL_CONNECTED) && (strcmp(WiFi.localIP().toString().c_str(), "0.0.0.0")!=0);
   }
   lastConnectAttempt = millis();
@@ -477,6 +519,9 @@ static void changeSerialConfig(SerialConfig conf)
 static int checkOpenConnections()
 {
   int num=WiFiClientNode::getNumOpenWiFiConnections();
+#ifdef ZIMODEM_CARDPUTER
+  HWSerial.setCalls(num);
+#endif
   if(num == 0)
   {
     if((dcdStatus == dcdActive)
@@ -560,19 +605,32 @@ void setup()
   for(int i=0;i<MAX_PIN_NO;i++)
     pinSupport[i]=false;
 #ifdef ZIMODEM_ESP32
+# ifdef ZIMODEM_CARDPUTER
+  auto cpCfg = M5.config();
+  M5Cardputer.begin(cpCfg, true);   // display, keyboard, etc. (before the serial port)
+# endif
   DBSerial.begin(115200); //the debug port
   DBSerial.setDebugOutput(true);
-# ifdef ARDUINO_ESP32S3_DEV
-    for(int i=1;i<=21;i++)
-      pinSupport[i]=true;
-
-    // 35,36,37 are PSRAM
-    for(int i=38;i<=42;i++)
-      pinSupport[i]=true;
-
-    for(int i=45;i<=48;i++)
-      pinSupport[i]=true;
-  # else
+# if defined(ZIMODEM_CARDPUTER)
+#  ifdef CARDPUTER_USE_CTRL_PINS
+   pinSupport[3]=true;
+   pinSupport[4]=true;
+   pinSupport[5]=true;
+   pinSupport[6]=true;
+   pinSupport[7]=true;
+   pinSupport[13]=true;
+#  endif
+# elif defined(ARDUINO_ESP32S3_DEV)
+  pinSupport[1]=true;
+  for(int i=5;i<=17;i++)
+    pinSupport[i]=true;
+  for(int i=19;i<=21;i++)
+    pinSupport[i]=true;
+  for(int i=36;i<=38;i++)
+    pinSupport[i]=true;
+  pinSupport[47]=true;
+  pinSupport[48]=true;
+# else
    pinSupport[2]=true;
    pinSupport[4]=true;
    pinSupport[5]=true;
@@ -707,6 +765,17 @@ void checkFactoryReset()
 
 void loop() 
 {
+#ifdef ZIMODEM_CARDPUTER
+  HWSerial.pump();   // keyboard + display
+  {
+    unsigned long nb = HWSerial.takeBaudRequest();   // baud rate chosen in the menu
+    if(nb > 0)
+    {
+      baudRate = (int)nb;
+      changeBaudRate(baudRate);
+    }
+  }
+#endif
   checkFactoryReset();
   checkReconnect();
   if(HWSerial.available())

@@ -325,6 +325,7 @@ bool XModem::receive()
       return ok;
     }
   }
+  return false;
 }
 
 unsigned short XModem::crc16_ccitt(char *buf, int size)

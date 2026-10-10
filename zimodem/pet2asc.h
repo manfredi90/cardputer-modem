@@ -32,8 +32,15 @@
 #   define MAIN_UART_NUM UART_NUM_2
 #   define DEBUG_UART_NUM UART_NUM_0
 # endif
+# ifdef ZIMODEM_CARDPUTER
+  // UART1 towards the retro computer, with the Cardputer keyboard + display.
+  // Debug goes to the native USB (Serial, with "USB CDC On Boot" enabled).
+  static CardputerModemSerial HWSerial(Serial1);
+#  define DBSerial Serial
+# else
   static HardwareSerial HWSerial(MAIN_UART_NUM);
   static HardwareSerial DBSerial(DEBUG_UART_NUM);
+# endif
 #else
 # include "ESP8266WiFi.h"
 # define HWSerial Serial

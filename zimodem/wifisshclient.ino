@@ -108,6 +108,7 @@ int WiFiSSHClient::connect(IPAddress ip, uint16_t port)
   if((err > 0) && (err != LIBSSH2_ERROR_EAGAIN)) {
     ibufSz += err;
   }
+  return true;
 }
 int WiFiSSHClient::connect(IPAddress ip, uint16_t port, int32_t timeout_ms)
 {

@@ -589,6 +589,7 @@ int KModem::spack(char type, int num, int len, char *data)
   *bufp = eol;      /* Extra-packet line terminator */
   for(i=0;i<bufp-buffer+1;i++) /* Send the packet */
     sendChar(&kserial,buffer[i]);
+  return 0;
 }
 
 /*

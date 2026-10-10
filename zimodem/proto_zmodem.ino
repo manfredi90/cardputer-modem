@@ -100,8 +100,8 @@ ZModem::ZModem(FS *zfs, void* cbdata)
     return(lputs(NULL,level,sbuf));
   }
 #else
-  int ZModem::lputs(void *unused, int level, const char * str) {}
-  int ZModem::lprintf(int level, const char *fmt, ...) {}
+  int ZModem::lputs(void *unused, int level, const char * str) { return 0; }
+  int ZModem::lprintf(int level, const char *fmt, ...) { return 0; }
 
   #define lprintf //lprintf
 #endif

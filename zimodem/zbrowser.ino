@@ -18,7 +18,11 @@
 
 static void initSDShell()
 {
-#ifdef DEFAULT_PIN_SD_CS
+#ifdef ZIMODEM_CARDPUTER
+  // Cardputer SD slot: SCK=40, MISO=39, MOSI=14, CS=12
+  SPI.begin(40, 39, 14, 12);
+  if(SD.begin(12, SPI, 25000000))
+#elif defined(DEFAULT_PIN_SD_CS)
   if(SD.begin(DEFAULT_PIN_SD_CS))
 #else
     if(SD.begin())
