@@ -46,7 +46,7 @@ The same key that opens the menu or the phonebook also closes it (`Esc` works to
 
 ## Wiring
 
-Default UART pins: **G13 = RX, G14 = TX**; both can be changed in the settings menu. Connect to the retro computer through a level shifter (e.g. a MAX232 for RS-232 serial ports); the ESP32 is 3.3 V only. The RX pin has the internal pull-up enabled.
+Default UART pins: **G13 = RX, G15 = TX**; both can be changed in the settings menu. Connect to the retro computer through a level shifter (e.g. a MAX232 for RS-232 serial ports); the ESP32 is 3.3 V only. The RX pin has the internal pull-up enabled.
 
 ## Building
 
