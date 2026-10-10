@@ -1,5 +1,9 @@
 # Zimodem for M5Stack Cardputer ADV
 
+
+![alt text](IMG/IMG_20261010_113526108.jpg)
+
+
 A fork of [Zimodem](https://github.com/bozimmerman/Zimodem) (Bo Zimmerman's WiFi modem firmware for retro computers) ported to the **M5Stack Cardputer ADV** (ESP32-S3).
 
 The Cardputer becomes a self-contained WiFi modem with its own terminal: the retro computer talks to it through the UART on the Grove port, while the built-in keyboard types AT commands and the display shows everything Zimodem prints, so you can configure WiFi and dial a BBS without a host computer attached.
