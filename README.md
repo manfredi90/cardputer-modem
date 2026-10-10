@@ -23,6 +23,9 @@ The Cardputer becomes a self-contained WiFi modem with its own terminal: the ret
 
 All Cardputer-specific code lives in `CardputerModemSerial.h`; it replaces Zimodem's `HWSerial` object. Defining `ZIMODEM_CARDPUTER` in `zimodem.ino` enables it; comment that line out to get the stock behaviour.
 
+
+![alt text](IMG/https://github.com/manfredi90/cardputer-modem/blob/master/IMG/IMG_20261010_115000913.jpg)
+
 ## Keys
 
 | Key | Action |
