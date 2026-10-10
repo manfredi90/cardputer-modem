@@ -1,10 +1,10 @@
-# Zimodem for M5Stack Cardputer / Cardputer ADV
+# Zimodem for M5Stack Cardputer ADV
 
 A fork of [Zimodem](https://github.com/bozimmerman/Zimodem) (Bo Zimmerman's WiFi modem firmware for retro computers) ported to the **M5Stack Cardputer ADV** (ESP32-S3).
 
 The Cardputer becomes a self-contained WiFi modem with its own terminal: the retro computer talks to it through the UART on the Grove port, while the built-in keyboard types AT commands and the display shows everything Zimodem prints, so you can configure WiFi and dial a BBS without a host computer attached.
 
-> **Note:** this port was developed with the help of AI (Claude, by Anthropic), under human direction and testing on real hardware. Review the code before relying on it; contributions and bug reports are welcome.
+> **Note:** this port was developed with the help of AI (Claude).
 
 ## Features
 
@@ -39,9 +39,7 @@ The same key that opens the menu or the phonebook also closes it (`Esc` works to
 
 ## Wiring
 
-Default UART pins (Grove port): **G1 = RX, G2 = TX**; both can be changed in the settings menu. Connect to the retro computer through a level shifter (e.g. a MAX232 for RS-232 serial ports); the ESP32 is 3.3 V only. The RX pin has the internal pull-up enabled.
-
-Optional hardware control lines (DCD/CTS/RTS/RI/DSR/DTR) can be enabled with `CARDPUTER_USE_CTRL_PINS` in `zimodem.ino`; check first that the pins are free on your board revision.
+Default UART pins: **G13 = RX, G14 = TX**; both can be changed in the settings menu. Connect to the retro computer through a level shifter (e.g. a MAX232 for RS-232 serial ports); the ESP32 is 3.3 V only. The RX pin has the internal pull-up enabled.
 
 ## Building
 
