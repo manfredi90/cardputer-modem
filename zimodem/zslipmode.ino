@@ -1,4 +1,16 @@
 #if INCLUDE_SLIP
+// lwip is built with CONFIG_LWIP_CHECK_THREAD_SAFETY: netif/ip calls made from the
+// Arduino loop task must hold the TCP/IP core lock, otherwise lwip asserts and reboots.
+#include "lwip/tcpip.h"
+#ifndef ZLWIP_LOCK
+# ifdef LOCK_TCPIP_CORE
+#  define ZLWIP_LOCK()   LOCK_TCPIP_CORE()
+#  define ZLWIP_UNLOCK() UNLOCK_TCPIP_CORE()
+# else
+#  define ZLWIP_LOCK()
+#  define ZLWIP_UNLOCK()
+# endif
+#endif
 /*
    Copyright 2022-2026 Bo Zimmerman
 
@@ -173,7 +185,9 @@ void ZSLIPMode::injectPacketToNetwork(uint8_t *data, int len)
 
   ip4_addr_t dest;
   IP4_ADDR(&dest, data[16], data[17], data[18], data[19]);
+  ZLWIP_LOCK();
   err_t err = original_wifi_output(wifi_netif, p, &dest);
+  ZLWIP_UNLOCK();
 
   if(err != ERR_OK)
     pbuf_free(p);
@@ -184,12 +198,14 @@ void ZSLIPMode::switchBackToCommandMode()
 {
   debugPrintf("\r\nMode:Command\r\n");
 
+  ZLWIP_LOCK();
   if(wifi_netif != NULL && original_wifi_output != NULL)
     wifi_netif->output = original_wifi_output;
   if(wifi_netif != NULL && original_wifi_input != NULL)
     wifi_netif->input = original_wifi_input;
 
   netif_remove(&slip_netif);
+  ZLWIP_UNLOCK();
   currMode = &commandMode;
 
   if(this->buf != 0)
@@ -216,6 +232,7 @@ void ZSLIPMode::switchTo()
   while(HWSerial.available() > 0)
     HWSerial.read();
 
+  ZLWIP_LOCK();
   wifi_netif = netif_list;
   while(wifi_netif != NULL)
   {
@@ -240,6 +257,7 @@ void ZSLIPMode::switchTo()
     original_wifi_input = wifi_netif->input;
     wifi_netif->input = slip_wifi_input_hook;
   }
+  ZLWIP_UNLOCK();
 
   ip4_addr_t ipaddr, netmask, gw;
   IPAddress wifiIP = WiFi.localIP();
@@ -262,9 +280,11 @@ void ZSLIPMode::switchTo()
   debugPrintf("SLIP: Using WiFi Gateway: %s\n", ip4addr_ntoa(&gw));
   debugPrintf("SLIP: Using WiFi Netmask: %s\n", ip4addr_ntoa(&netmask));
 
+  ZLWIP_LOCK();
   netif_add(&slip_netif, &ipaddr, &netmask, &gw, NULL, slip_netif_init, ip_input);
   netif_set_up(&slip_netif);
   netif_set_link_up(&slip_netif);
+  ZLWIP_UNLOCK();
 
   currMode = &slipMode;
   debugPrintf("SLIP mode active\n\r");

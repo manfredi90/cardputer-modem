@@ -1,4 +1,16 @@
 #if INCLUDE_PPP
+// lwip is built with CONFIG_LWIP_CHECK_THREAD_SAFETY: netif/ip calls made from the
+// Arduino loop task must hold the TCP/IP core lock, otherwise lwip asserts and reboots.
+#include "lwip/tcpip.h"
+#ifndef ZLWIP_LOCK
+# ifdef LOCK_TCPIP_CORE
+#  define ZLWIP_LOCK()   LOCK_TCPIP_CORE()
+#  define ZLWIP_UNLOCK() UNLOCK_TCPIP_CORE()
+# else
+#  define ZLWIP_LOCK()
+#  define ZLWIP_UNLOCK()
+# endif
+#endif
 
 static const uint16_t fcstab[256] = {
   0x0000, 0x1189, 0x2312, 0x329b, 0x4624, 0x57ad, 0x6536, 0x74bf,
@@ -344,7 +356,7 @@ void ZPPPMode::sendPacketToSerial(struct pbuf *p)
 
   struct pbuf *q = p;
   int total = 0;
-  uint8_t tempBuf[1600];
+  static uint8_t tempBuf[1600];   // static: this runs on the small lwip tcpip task stack
 
   while(q != NULL)
   {
@@ -391,7 +403,9 @@ void ZPPPMode::injectPacketToNetwork(uint8_t *data, int len)
   ip4_addr_t dest;
   IP4_ADDR(&dest, data[16], data[17], data[18], data[19]);
 
+  ZLWIP_LOCK();
   err_t err = original_wifi_output(wifi_netif, p, &dest);
+  ZLWIP_UNLOCK();
 
   if(err != ERR_OK)
     pbuf_free(p);
@@ -401,12 +415,14 @@ void ZPPPMode::switchBackToCommandMode()
 {
   debugPrintf("\r\nMode:Command\r\n");
 
+  ZLWIP_LOCK();
   if(wifi_netif != NULL && original_wifi_output != NULL)
     wifi_netif->output = original_wifi_output;
   if(wifi_netif != NULL && original_wifi_input != NULL)
     wifi_netif->input = original_wifi_input;
 
   netif_remove(&ppp_netif);
+  ZLWIP_UNLOCK();
   currMode = &commandMode;
 
   if(this->buf != 0)
@@ -439,6 +455,7 @@ void ZPPPMode::switchTo()
   while(HWSerial.available() > 0)
     HWSerial.read();
 
+  ZLWIP_LOCK();
   wifi_netif = netif_list;
   while(wifi_netif != NULL)
   {
@@ -462,6 +479,7 @@ void ZPPPMode::switchTo()
     original_wifi_input = wifi_netif->input;
     wifi_netif->input = ppp_wifi_input_hook;
   }
+  ZLWIP_UNLOCK();
 
   ip4_addr_t ipaddr, netmask, gw;
   IPAddress wifiIP = WiFi.localIP();
@@ -485,9 +503,11 @@ void ZPPPMode::switchTo()
   debugPrintf("PPP: Using WiFi Gateway: %s\n", ip4addr_ntoa(&gw));
   debugPrintf("PPP: Using WiFi Netmask: %s\n", ip4addr_ntoa(&netmask));
 
+  ZLWIP_LOCK();
   netif_add(&ppp_netif, &ipaddr, &netmask, &gw, NULL, ppp_netif_init, ip_input);
   netif_set_up(&ppp_netif);
   netif_set_link_up(&ppp_netif);
+  ZLWIP_UNLOCK();
 
   currMode = &pppMode;
   debugPrintf("PPP mode active\n\r");

@@ -2334,6 +2334,9 @@ _libssh2_channel_write(LIBSSH2_CHANNEL *channel, int stream_id,
                            channel->remote.id, stream_id);
             channel->write_bufwrite = channel->local.packet_size;
         }
+        /* Zimodem/ESP32: keep each packet well inside MAX_SSH_PACKET_LEN */
+        if(channel->write_bufwrite > 4096)
+            channel->write_bufwrite = 4096;
         /* store the size here only, the buffer is passed in as-is to
            _libssh2_transport_send() */
         _libssh2_store_u32(&s, channel->write_bufwrite);

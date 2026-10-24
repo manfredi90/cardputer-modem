@@ -28,6 +28,9 @@ WiFiSSHClient::~WiFiSSHClient()
 
 void WiFiSSHClient::closeSSH()
 {
+#ifdef ZIMODEM_CARDPUTER
+  HWSerial.setSshTerm(false);
+#endif
   if(channel) {
     libssh2_channel_send_eof(channel);
     libssh2_channel_close(channel);
@@ -74,6 +77,12 @@ int WiFiSSHClient::connect(IPAddress ip, uint16_t port)
   if(::connect(sock, (struct sockaddr*)(&sin), sizeof(struct sockaddr_in)) != 0)
     return false;
   session = libssh2_session_init();
+  if(session == null)
+  {
+    debugPrintf("wifisshclient: out of memory (largest free block %d)\n\r", (int)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    closeSSH();
+    return false;
+  }
   if(libssh2_session_handshake(session, sock))
   {
     debugPrintf("wifisshclient: failed handshake\n\r");
@@ -93,7 +102,13 @@ int WiFiSSHClient::connect(IPAddress ip, uint16_t port)
     closeSSH();
     return false;
   }
-  if(libssh2_channel_request_pty(channel, "vanilla")) 
+  // "xterm" exists in every terminfo database and the terminal emulates what it needs; the size is the Cardputer virtual screen
+  int ptyCols = 80, ptyRows = 24;
+#ifdef ZIMODEM_CARDPUTER
+  ptyCols = HWSerial.termCols();
+  ptyRows = HWSerial.termRows();
+#endif
+  if(libssh2_channel_request_pty_ex(channel, "xterm", 5, NULL, 0, ptyCols, ptyRows, 0, 0))
   {
     debugPrintf("wifisshclient: failed pty\n\r");
     closeSSH();
@@ -104,6 +119,9 @@ int WiFiSSHClient::connect(IPAddress ip, uint16_t port)
     closeSSH();
     return false;
   }
+#ifdef ZIMODEM_CARDPUTER
+  HWSerial.setSshTerm(true);
+#endif
   ssize_t err = libssh2_channel_read(channel, ibuf, INTERNAL_BUF_SIZE);
   if((err > 0) && (err != LIBSSH2_ERROR_EAGAIN)) {
     ibufSz += err;

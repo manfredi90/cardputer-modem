@@ -175,7 +175,11 @@ struct iovec {
  * total packet size of 35000 bytes or less (including length,
  * padding length, payload, padding, and MAC.)."
  */
-#define MAX_SSH_PACKET_LEN 35000
+/* Zimodem/ESP32: this buffer lives inside LIBSSH2_SESSION (one malloc), so 35000
+ * made the session ~54 KB and the allocation failed on a Cardputer with the
+ * terminal buffers in RAM. Outgoing packets are limited to ZIM_SSH_MAX_WRITE
+ * (see channel.c), so a much smaller buffer is enough. */
+#define MAX_SSH_PACKET_LEN 8192
 #define MAX_SHA_DIGEST_LEN SHA512_DIGEST_LENGTH
 
 #define LIBSSH2_ALLOC(session, count) \

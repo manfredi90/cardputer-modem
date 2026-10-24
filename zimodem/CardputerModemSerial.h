@@ -21,8 +21,10 @@
  *  - optional 80-column and 25-row virtual screens with manual horizontal pan
  *  - settings menu: virtual screen, text color, UART RX/TX pins, baud rate,
  *    UART input on/off, encoding (stored in NVS)
- *  - phonebook with 10 BBS entries (name + host[:port]), stored in NVS;
+ *  - BBS phonebook with 10 entries (name + host[:port]), stored in NVS;
  *    dialing types "ATDT host[:port]" into Zimodem for you
+ *  - SSH phonebook with 10 entries (name, user, password, host, optional port),
+ *    stored in NVS; dialing types ATDS"user:password@host[:port]" for you
  *  - when the baud rate is changed in the menu, "AT&W" is sent to Zimodem
  *    (if no call is open) so that it is saved in its configuration
  *  - pull-up on the RX pin (a floating RX produced random characters)
@@ -34,14 +36,18 @@
  *   Ctrl+letter        control code (Ctrl+C = 0x03, etc.)
  *   Fn + `             ESC
  *   Fn + 1             settings menu (Up/Down item, Left/Right value, Enter/Esc)
- *   Fn + 2             phonebook (Up/Down slot, Enter dial, Tab edit, Esc exit)
- *   Fn + 3             display encoding: CP437 -> UTF-8 -> PETSCII
+ *   Fn + 2             display encoding: CP437 -> UTF-8 -> PETSCII
+ *   Fn + 3             BBS phonebook (Up/Down slot, Enter dial, Tab edit, Esc exit)
+ *   Fn + 4             SSH phonebook (same keys; Tab/Up/Down move between fields)
  *   Fn + Left/Right    (with 80 columns active) pans the window by 1 column
  *                      (repeats when held down)
  *   Fn + Backspace     Del (ESC [ 3 ~)
  *   Fn + Up / Down     scrollback by 1 row (repeats when held down)
  *   Fn + Left/Right    (80 columns off) scrollback one page back / forward
  *   Shift+Fn+arrows    sends the arrow keys to the host (ESC [ A/B/C/D)
+ *   Alt + arrow key    same as Shift+Fn+arrows (repeats when held); handy in mc, nano, ...
+ *   Alt + 1..9,0,-,=   F1..F12 (xterm sequences; PETSCII: C64 F1..F8)
+ *   Alt + other key    ESC prefix + key (Meta)
  *   any other key typed brings the screen back to the bottom (live)
  * The Cardputer arrows are ; . , / on the Fn layer: Up=; Down=. Left=, Right=/
  */
@@ -51,9 +57,17 @@
 #include <Preferences.h>
 #ifdef ARDUINO_ARCH_ESP32
 #include "driver/gpio.h"
+#include "esp_system.h"
 #endif
 #include <vector>
 #include <algorithm>
+
+// SSH (libssh2) and PPP/SLIP need more than the default 8 KB loop task stack.
+// Defined here, not in the .ino: the Arduino IDE inserts its auto-generated
+// prototypes before the first function found in the sketch files.
+#ifdef SET_LOOP_TASK_STACK_SIZE
+SET_LOOP_TASK_STACK_SIZE(16 * 1024);
+#endif
 
 #ifndef CARDPUTER_MODEM_RX
 #define CARDPUTER_MODEM_RX 1   // Grove G1 (check against your board's pinout)
@@ -71,7 +85,7 @@
 #endif
 
 // Initial encoding of received bytes >= 0x80: 0 = CP437 (DOS), 1 = UTF-8.
-// Can be changed on the fly with Fn+3.
+// Can be changed on the fly with Fn+2.
 #ifndef CARDPUTER_TERM_UTF8_DEFAULT
 #define CARDPUTER_TERM_UTF8_DEFAULT 0
 #endif
@@ -313,7 +327,7 @@ public:
   static const int MAXC = 80;     // width of the virtual screen
   static const int BAR_Y = 128;   // status bar: 7 px (128..134) of 135
   static const int BAR_H = 7;
-  static const int KB_BUF = 64;
+  static const int KB_BUF = 160;
 
   explicit CardputerModemSerial(HardwareSerial &uart) : _uart(uart) {}
 
@@ -369,6 +383,39 @@ public:
   // Kept for compatibility: keyboard and display run in their own task.
   void pump() {}
 
+  // Size of the virtual screen, reported to SSH servers as the pty size.
+  int termCols() const { return _cols; }
+  int termRows() const { return _rows; }
+  // Called by the SSH client: when the session ends, leave application cursor keys / alternate screen.
+  void setSshTerm(bool on) {
+    if (on) return;
+    xSemaphoreTake(_termMux, portMAX_DELAY);
+    _appCursor = false; setAlt(false); _dirty = true;
+    xSemaphoreGive(_termMux);
+  }
+  // Shows a line on the display after an abnormal reset (crash, watchdog, brownout),
+  // to help diagnose reboots. Call once after begin().
+  void reportReset() {
+#ifdef ARDUINO_ARCH_ESP32
+    const char *why = nullptr;
+    switch (esp_reset_reason()) {
+      case ESP_RST_PANIC:    why = "panic (crash)"; break;
+      case ESP_RST_INT_WDT:  why = "interrupt watchdog"; break;
+      case ESP_RST_TASK_WDT: why = "task watchdog"; break;
+      case ESP_RST_WDT:      why = "watchdog"; break;
+      case ESP_RST_BROWNOUT: why = "brownout"; break;
+      default: break;
+    }
+    if (!why) return;
+    char b[48];
+    snprintf(b, sizeof(b), "[last reset: %s]\r\n", why);
+    xSemaphoreTake(_termMux, portMAX_DELAY);
+    for (const char *c = b; *c; c++) termPut((uint8_t)*c);
+    _dirty = true;
+    xSemaphoreGive(_termMux);
+#endif
+  }
+
   // ---- Stream ----
   int available() override { return (int)_kbCount + uartAvail(); }
 
@@ -414,8 +461,9 @@ private:
   enum : uint8_t {
     HID_F2KEY = 0x3B, HID_KEY2 = 0x1F,
     HID_ENTER = 0x28, HID_ESC = 0x29, HID_BS = 0x2A, HID_DEL = 0x4C,
-    HID_F3KEY = 0x3C, HID_KEY3 = 0x20,   // Fn+2 opens the phonebook, Fn+3 changes encoding
-    HID_F1KEY = 0x3A, HID_KEY1 = 0x1E,   // Fn+1 opens the settings menu
+    HID_F3KEY = 0x3C, HID_KEY3 = 0x20,   // Fn+3 opens the BBS phonebook
+    HID_F4KEY = 0x3D, HID_KEY4 = 0x21,   // Fn+4 opens the SSH phonebook
+    HID_F1KEY = 0x3A, HID_KEY1 = 0x1E,   // Fn+1 opens the settings menu (Fn+2 = encoding)
     HID_RIGHT = 0x4F, HID_LEFT = 0x50, HID_DOWN = 0x51, HID_UP = 0x52
   };
 
@@ -443,6 +491,12 @@ private:
   std::vector<uint8_t> _prevHid;
   bool _prevEnter = false, _prevTab = false, _prevDel = false;
   uint8_t _repKey = 0;           // scroll key being repeated (0 = none)
+  char _altRepCh = 0;            // Alt+arrow being repeated (0 = none)
+  uint32_t _altRepAt = 0;
+  bool _appCursor = false;       // DECCKM (ESC [ ? 1 h): cursor keys send ESC O x instead of ESC [ x
+  bool _altScr = false;          // alternate screen active (ESC [ ? 1049 h)
+  int _altRow = 0, _altCol = 0;
+  Cell _altBuf[MAXR][MAXC];
   uint32_t _repAt = 0;
   uint8_t _dbgKey = 0;           // last unrecognized Fn key (shown in bar)
   uint32_t _dbgUntil = 0;
@@ -457,8 +511,12 @@ private:
   bool _tall = true;
   int _panY = 0;                 // first screen row shown (window of ROWS rows)
   int _lastCurRow = -1;
+  bool _panYHold = false;        // window moved by hand (Fn+Up/Down): don't follow the cursor
   int _viewOff = 0;              // 0 = live, >0 = rows back in scrollback
   int _row = 0, _col = 0;        // _col == COLS means "wrap pending"
+  int _regTop = 0, _regBot = ROWS - 1;   // scroll region (CSI r), rows inclusive
+  bool _acs = false;             // ESC ( 0 : VT100 line-drawing set active
+  char _chKind = 0;              // which of ESC ( ESC ) ESC # is being parsed
   int _saveRow = 0, _saveCol = 0;
   bool _curVisible = true;
   uint8_t _fg = 7, _bg = 0;
@@ -497,14 +555,37 @@ private:
   uint8_t _mSel = 0;
   enum { M_N = 9 };
 
-  // phonebook: 10 BBSes (name + host[:port]), saved in NVS
-  enum { B_N = 10, B_NAME = 16, B_ADDR = 38 };
+  // phonebooks, saved in NVS. Kind 0: BBS (name, host[:port]) dialed with ATDT.
+  // Kind 1: SSH (name, user, password, host, port) dialed with ATDS"user:pass@host:port".
+  enum { B_N = 10, B_MAXF = 5, B_FLEN = 40 };
   bool _book = false, _bEdit = false;
-  uint8_t _bSel = 0, _bField = 0;
-  char _bName[B_N][B_NAME + 1] = {{0}};
-  char _bAddr[B_N][B_ADDR + 1] = {{0}};
-  char _eName[B_NAME + 1] = "", _eAddr[B_ADDR + 1] = "";
+  uint8_t _bk = 0, _bSel = 0, _bField = 0;
+  char _bd[2][B_N][B_MAXF][B_FLEN + 1] = {};
+  char _be[B_MAXF][B_FLEN + 1] = {};
   char _bMsg[28] = "";
+
+  static int bkN(int k) { return k ? 5 : 2; }
+  static int bkMax(int k, int f) {
+    static const uint8_t m0[2] = {16, 38}, m1[5] = {16, 16, 24, 38, 5};
+    return k ? m1[f] : m0[f];
+  }
+  static const char *bkLbl(int k, int f) {
+    static const char *l0[2] = {"Name", "Address (host or host:port)"};
+    static const char *l1[5] = {"Name", "User", "Password", "Host", "Port (optional, default 22)"};
+    return k ? l1[f] : l0[f];
+  }
+  // Characters that would break the AT dial string are not accepted.
+  static bool bkAllow(int k, int f, char c) {
+    if (c < 32 || c > 126) return false;
+    if (f == 0) return true;
+    if (!k) return c != ' ' && c != '"';
+    switch (f) {
+      case 1: case 3: return !strchr(" @:\",", c);
+      case 2:         return !strchr(" @\",", c);
+      case 4:         return c >= '0' && c <= '9';
+    }
+    return false;
+  }
 
   // status bar / drawing state (display task only)
   volatile bool _dirty = false;
@@ -590,20 +671,29 @@ private:
   static void cleanTxt(char *t) {                  // printable ASCII only
     for (char *c = t; *c; c++) if ((uint8_t)*c < 32 || (uint8_t)*c > 126) *c = ' ';
   }
+  static void bkKey(char *k, int kind, int f, int i) {
+    static const char *p0[2] = {"n", "a"};
+    static const char *p1[5] = {"sn", "su", "sp", "sh", "so"};
+    snprintf(k, 8, "%s%d", kind ? p1[f] : p0[f], i);
+  }
   void loadBook() {
     if (!_prefs.begin("cpmodem", false)) return;
-    for (int i = 0; i < B_N; i++) {
-      char k[6];
-      snprintf(k, sizeof(k), "n%d", i); _bName[i][0] = 0; _prefs.getString(k, _bName[i], sizeof(_bName[i])); cleanTxt(_bName[i]);
-      snprintf(k, sizeof(k), "a%d", i); _bAddr[i][0] = 0; _prefs.getString(k, _bAddr[i], sizeof(_bAddr[i])); cleanTxt(_bAddr[i]);
-    }
+    for (int kd = 0; kd < 2; kd++)
+      for (int i = 0; i < B_N; i++)
+        for (int f = 0; f < bkN(kd); f++) {
+          char k[8]; bkKey(k, kd, f, i);
+          char *d = _bd[kd][i][f]; d[0] = 0;
+          _prefs.getString(k, d, bkMax(kd, f) + 1);
+          cleanTxt(d);
+        }
     _prefs.end();
   }
-  void saveBookSlot(int i) {
+  void saveBookSlot(int kd, int i) {
     if (!_prefs.begin("cpmodem", false)) return;
-    char k[6];
-    snprintf(k, sizeof(k), "n%d", i); _prefs.putString(k, _bName[i]);
-    snprintf(k, sizeof(k), "a%d", i); _prefs.putString(k, _bAddr[i]);
+    for (int f = 0; f < bkN(kd); f++) {
+      char k[8]; bkKey(k, kd, f, i);
+      _prefs.putString(k, _bd[kd][i][f]);
+    }
     _prefs.end();
   }
 
@@ -672,11 +762,12 @@ private:
       }
     }
     _rows = want;
+    _regTop = 0; _regBot = _rows - 1;
     if (_row >= _rows) _row = _rows - 1;
     if (_saveRow >= _rows) _saveRow = _rows - 1;
     if (_panY > _rows - ROWS) _panY = _rows - ROWS;
     if (_panY < 0) _panY = 0;
-    _lastCurRow = -1;
+    _lastCurRow = -1; _panYHold = false;
   }
 
   void setTall(bool t) {
@@ -775,7 +866,7 @@ private:
     std::vector<uint8_t> nh;
     newItems(_prevHid, st.hid_keys, nh, false);
     bool acted = false;
-    for (uint8_t k : nh) {
+    if (st.fn) for (uint8_t k : nh) {                 // see onPressBook: only with Fn
       switch (k) {
         case HID_UP:    menuKey(0); acted = true; break;
         case HID_DOWN:  menuKey(1); acted = true; break;
@@ -798,44 +889,52 @@ private:
     if (st.del && !_prevDel && !st.fn) menuKey(5);
   }
 
-  // ----------------------------------------------------------- phonebook
-  void openBook() {
-    _book = true; _bEdit = false; _bSel = 0; _bMsg[0] = 0; _repKey = 0; _dirty = true;
+  // ---------------------------------------------------------- phonebooks
+  void openBook(int kind) {
+    _book = true; _bk = (uint8_t)kind; _bEdit = false; _bSel = 0; _bMsg[0] = 0; _repKey = 0; _dirty = true;
   }
   void closeBook() { _book = false; _bEdit = false; _dirty = true; }
 
   void bookEditStart() {
-    strcpy(_eName, _bName[_bSel]); strcpy(_eAddr, _bAddr[_bSel]);
+    for (int f = 0; f < bkN(_bk); f++) strcpy(_be[f], _bd[_bk][_bSel][f]);
     _bEdit = true; _bField = 0; _bMsg[0] = 0;
   }
   void bookEditSave() {
-    // strip leading/trailing spaces from the address
-    char *a = _eAddr; while (*a == ' ') a++;
-    size_t n = strlen(a); while (n && a[n - 1] == ' ') a[--n] = 0;
-    strcpy(_bName[_bSel], _eName); strcpy(_bAddr[_bSel], a);
-    saveBookSlot(_bSel);
+    if (_bk && _be[4][0]) {
+      long p = atol(_be[4]);
+      if (p < 1 || p > 65535) { snprintf(_bMsg, sizeof(_bMsg), "Bad port (1-65535)"); return; }
+    }
+    for (int f = 0; f < bkN(_bk); f++) strcpy(_bd[_bk][_bSel][f], _be[f]);
+    saveBookSlot(_bk, _bSel);
     _bEdit = false; snprintf(_bMsg, sizeof(_bMsg), "Slot %d saved", _bSel + 1);
   }
   void bookDial() {
-    const char *a = _bAddr[_bSel];
-    if (!a[0]) { snprintf(_bMsg, sizeof(_bMsg), "Slot empty"); return; }
+    char cmd[112];
+    char (*e)[B_FLEN + 1] = _bd[_bk][_bSel];
+    if (!_bk) {
+      if (!e[1][0]) { snprintf(_bMsg, sizeof(_bMsg), "Slot empty"); return; }
+      snprintf(cmd, sizeof(cmd), "ATDT %s\r", e[1]);
+    } else {
+      if (!e[1][0] || !e[3][0]) { snprintf(_bMsg, sizeof(_bMsg), e[1][0] || e[3][0] ? "User and host needed" : "Slot empty"); return; }
+      snprintf(cmd, sizeof(cmd), "ATDS\"%s:%s@%s%s%s\"\r", e[1], e[2], e[3], e[4][0] ? ":" : "", e[4]);
+    }
     if (_calls > 0) { snprintf(_bMsg, sizeof(_bMsg), "In call: ATH first"); return; }
-    if (_kbCount > 8) { snprintf(_bMsg, sizeof(_bMsg), "Keyboard busy"); return; }
+    if ((int)strlen(cmd) > KB_BUF - (int)_kbCount) { snprintf(_bMsg, sizeof(_bMsg), "Keyboard busy"); return; }
     closeBook(); goLive();
-    for (const char *c = "ATDT "; *c; c++) kbPush((uint8_t)*c);   // always ASCII (outside a call)
-    for (const char *c = a; *c; c++) kbPush((uint8_t)*c);
-    kbPush('\r');
+    for (const char *c = cmd; *c; c++) kbPush((uint8_t)*c);   // always ASCII (we are outside a call)
   }
 
-  // act: 0 up, 1 down, 2 enter, 3 tab, 4 exit/cancel, 5 backspace
+  // act: 0 up/previous field, 1 down/next field, 2 enter, 3 tab, 4 exit/cancel, 5 backspace
   void bookKey(int act) {
     _bMsg[0] = 0;
     if (_bEdit) {
+      int n = bkN(_bk);
       switch (act) {
-        case 0: case 1: case 3: _bField ^= 1; break;
+        case 0: _bField = (_bField + n - 1) % n; break;
+        case 1: case 3: _bField = (_bField + 1) % n; break;
         case 2: bookEditSave(); break;
         case 4: _bEdit = false; break;
-        case 5: { char *t = _bField ? _eAddr : _eName; size_t n = strlen(t); if (n) t[n - 1] = 0; } break;
+        case 5: { char *t = _be[_bField]; size_t l = strlen(t); if (l) t[l - 1] = 0; } break;
       }
     } else {
       switch (act) {
@@ -849,10 +948,10 @@ private:
     _dirty = true;
   }
   void bookChar(char c) {
-    if (c < 32 || c > 126) return;
-    char *t = _bField ? _eAddr : _eName; size_t mx = _bField ? B_ADDR : B_NAME;
-    size_t n = strlen(t); if (n >= mx) return;
-    t[n] = c; t[n + 1] = 0; _bMsg[0] = 0; _dirty = true;
+    if (!bkAllow(_bk, _bField, c)) return;
+    char *t = _be[_bField];
+    size_t l = strlen(t); if ((int)l >= bkMax(_bk, _bField)) return;
+    t[l] = c; t[l + 1] = 0; _bMsg[0] = 0; _dirty = true;
   }
 
   void onPressBook(Keyboard_Class::KeysState &st) {
@@ -860,18 +959,19 @@ private:
     newItems(_prevHid, st.hid_keys, nh, false);
     std::vector<char> nw;
     newItems(_prevWord, st.word, nw, true);
-    for (uint8_t k : nh) {
-      switch (k) {
-        case HID_UP:   bookKey(0); break;
-        case HID_DOWN: bookKey(1); break;
-        case HID_ESC: case HID_F2KEY: case HID_KEY2: bookKey(4); if (!_book) return; break;
-        default: break;
-      }
+    const uint8_t hidMine = _bk ? HID_F4KEY : HID_F3KEY, hidMine2 = _bk ? HID_KEY4 : HID_KEY3;
+    const char w1 = _bk ? '4' : '3', w2 = _bk ? '$' : '#';
+    // The library also reports ordinary keys in hid_keys (e.g. 0x21 = '4' even without Fn),
+    // so these codes only count as commands when Fn is held.
+    if (st.fn) for (uint8_t k : nh) {
+      if (k == HID_UP) bookKey(0);
+      else if (k == HID_DOWN) bookKey(1);
+      else if (k == HID_ESC || k == hidMine || k == hidMine2) { bookKey(4); if (!_book) return; }
     }
     for (char c : nw) {
-      if (st.fn) {                              // old libraries: with Fn the characters stay in word
+      if (st.fn) {                              // older libraries: with Fn the characters stay in word
         if (c == ';') bookKey(0); else if (c == '.') bookKey(1);
-        else if (c == '`' || c == '2' || c == '@') { bookKey(4); if (!_book) return; }
+        else if (c == '`' || c == w1 || c == w2) { bookKey(4); if (!_book) return; }
       } else if (_bEdit) {
         bookChar(c);
       } else {
@@ -1047,12 +1147,42 @@ private:
     return c;
   }
 
+  // F1..F12 (xterm sequences). PETSCII: C64 function keys (F1..F8).
+  void kbPushFKey(int n) {
+    if (petKeys()) {
+      static const uint8_t pf[8] = {0x85, 0x89, 0x86, 0x8A, 0x87, 0x8B, 0x88, 0x8C};
+      if (n <= 8) kbPush(pf[n - 1]);
+      return;
+    }
+    kbPush(0x1B);
+    if (n <= 4) { kbPush('O'); kbPush((uint8_t)('P' + n - 1)); return; }
+    static const uint8_t code[8] = {15, 17, 18, 19, 20, 21, 23, 24};
+    int c = code[n - 5];
+    kbPush('['); kbPush((uint8_t)('0' + c / 10)); kbPush((uint8_t)('0' + c % 10)); kbPush('~');
+  }
+
+  // Alt + arrow key (; . , /) -> cursor key, Alt + 1..9,0,-,= -> F1..F12. Returns true if mapped.
+  bool altKey(char c) {
+    switch (c) {
+      case ';': kbPushArrow('A'); return true;     // no goLive(): the view you scrolled to stays put
+      case '.': kbPushArrow('B'); return true;
+      case ',': kbPushArrow('D'); return true;
+      case '/': kbPushArrow('C'); return true;
+      default: break;
+    }
+    int n = 0;
+    if (c >= '1' && c <= '9') n = c - '0'; else if (c == '0') n = 10; else if (c == '-') n = 11; else if (c == '=') n = 12;
+    if (!n) return false;
+    kbPushFKey(n);
+    return true;
+  }
+
   void kbPushArrow(char dir) {             // ESC [ A/B/C/D
     if (petKeys()) {
       kbPush(dir == 'A' ? 0x91 : dir == 'B' ? 0x11 : dir == 'C' ? 0x1D : 0x9D);
       return;
     }
-    kbPush(0x1B); kbPush('['); kbPush((uint8_t)dir);
+    kbPush(0x1B); kbPush(_appCursor ? 'O' : '['); kbPush((uint8_t)dir);
   }
 
   // ------------------------------------------------------------ keyboard
@@ -1080,6 +1210,7 @@ private:
   void goLive() {
     xSemaphoreTake(_termMux, portMAX_DELAY);
     if (_viewOff != 0) { _viewOff = 0; _dirty = true; }
+    _panYHold = false;
     _lastCurRow = -1;                          // bring the window back to the cursor
     xSemaphoreGive(_termMux);
   }
@@ -1090,12 +1221,15 @@ private:
     int n = lines < 0 ? -lines : lines;
     for (int i = 0; i < n; i++) {
       if (lines > 0) {                                   // upward
-        if (_viewOff == 0 && _panY > 0) _panY--;
+        if (_viewOff == 0 && _panY > 0) { _panY--; _panYHold = true; }
         else if (_viewOff < _histCount) _viewOff++;
         else break;
       } else {                                           // downward
         if (_viewOff > 0) _viewOff--;
-        else if (_panY < _rows - ROWS) _panY++;
+        else if (_panY < _rows - ROWS) {
+          _panY++;
+          if (_panY >= _rows - ROWS) { _panYHold = false; _lastCurRow = -1; }   // back at the bottom: follow again
+        }
         else break;
       }
       _dirty = true;
@@ -1125,19 +1259,20 @@ private:
     if (_book) { onPressBook(st); return; }
     if (st.fn) {
       // --- Fn layer: the library (>= 1.1) puts arrows/ESC/Del in hid_keys ---
-      bool tog = false, menuReq = false, bookReq = false;       // one action per keypress
+      bool tog = false, menuReq = false; int bookReq = -1;       // one action per keypress
       std::vector<uint8_t> nh;
       newItems(_prevHid, st.hid_keys, nh, false);
       for (uint8_t k : nh) {
         switch (k) {
           case HID_UP: case HID_DOWN: case HID_LEFT: case HID_RIGHT:
-            if (st.shift) { goLive(); kbPushArrow(arrowLetter(k)); }      // arrow to the host
+            if (st.shift) { kbPushArrow(arrowLetter(k)); }                // arrow to the host (view stays)
             else { scrollKey(k); _repKey = k; _repAt = now + 400; }       // scrollback
             break;
           case HID_ESC: goLive(); kbPush(0x1B); break;
           case HID_F1KEY: case HID_KEY1: menuReq = true; break;
-          case HID_F2KEY: case HID_KEY2: bookReq = true; break;
-          case HID_F3KEY: case HID_KEY3: tog = true; break;
+          case HID_F2KEY: case HID_KEY2: tog = true; break;
+          case HID_F3KEY: case HID_KEY3: bookReq = 0; break;
+          case HID_F4KEY: case HID_KEY4: bookReq = 1; break;
           case HID_DEL: goLive(); if (petKeys()) kbPush(0x14); else { kbPush(0x1B); kbPush('['); kbPush('3'); kbPush('~'); } break;
           default: _dbgKey = k; _dbgUntil = now + 3000; _dirty = true; break;   // status bar diagnostics
         }
@@ -1149,17 +1284,18 @@ private:
         switch (c) {
           case '`': goLive(); kbPush(0x1B); break;
           case '1': case '!': menuReq = true; break;
-          case '2': case '@': bookReq = true; break;
-          case '3': case '#': tog = true; break;
-          case ';': if (st.shift) { goLive(); kbPushArrow('A'); } else { scrollKey(HID_UP);   _repKey = HID_UP;   _repAt = now + 400; } break;
-          case '.': if (st.shift) { goLive(); kbPushArrow('B'); } else { scrollKey(HID_DOWN); _repKey = HID_DOWN; _repAt = now + 400; } break;
-          case ',': if (st.shift) { goLive(); kbPushArrow('D'); } else { scrollKey(HID_LEFT); _repKey = HID_LEFT; _repAt = now + 400; } break;
-          case '/': if (st.shift) { goLive(); kbPushArrow('C'); } else { scrollKey(HID_RIGHT);_repKey = HID_RIGHT;_repAt = now + 400; } break;
+          case '2': case '@': tog = true; break;
+          case '3': case '#': bookReq = 0; break;
+          case '4': case '$': bookReq = 1; break;
+          case ';': if (st.shift) { kbPushArrow('A'); } else { scrollKey(HID_UP);   _repKey = HID_UP;   _repAt = now + 400; } break;
+          case '.': if (st.shift) { kbPushArrow('B'); } else { scrollKey(HID_DOWN); _repKey = HID_DOWN; _repAt = now + 400; } break;
+          case ',': if (st.shift) { kbPushArrow('D'); } else { scrollKey(HID_LEFT); _repKey = HID_LEFT; _repAt = now + 400; } break;
+          case '/': if (st.shift) { kbPushArrow('C'); } else { scrollKey(HID_RIGHT);_repKey = HID_RIGHT;_repAt = now + 400; } break;
           default: break;
         }
       }
       if (menuReq) { openMenu(); return; }
-      if (bookReq) { openBook(); return; }
+      if (bookReq >= 0) { openBook(bookReq); return; }
       if (tog) toggleEncoding();
       return;
     }
@@ -1169,6 +1305,13 @@ private:
     std::vector<char> nw;
     newItems(_prevWord, st.word, nw, true);
     for (char c : nw) {
+      if (st.alt) {                            // Alt+arrow / Alt+digit; other Alt+key = ESC prefix (meta)
+        if (altKey(c)) {
+          if (c == ';' || c == '.' || c == ',' || c == '/') { _altRepCh = c; _altRepAt = now + 400; }
+          continue;
+        }
+        if (!petKeys()) { kbPush(0x1B); kbPush((uint8_t)c); continue; }
+      }
       if (st.ctrl && isalpha((unsigned char)c)) c = toupper((unsigned char)c) & 0x1F;
       kbPush(petKeys() ? petKeyOut((uint8_t)c) : (uint8_t)c);
       any = true;
@@ -1189,7 +1332,7 @@ private:
     if (cnt == 0) {
       _prevWord.clear(); _prevHid.clear();
       _prevEnter = _prevTab = _prevDel = false;
-      _lastCnt = 0; _repKey = 0;
+      _lastCnt = 0; _repKey = 0; _altRepCh = 0;
       return;
     }
     auto &st = kb.keysState();
@@ -1208,6 +1351,12 @@ private:
         scrollKey(_repKey);
         _repAt = now + ((_repKey == HID_UP || _repKey == HID_DOWN) ? 60 : (wide80() ? 35 : 180));
       }
+    }
+
+    // Alt+arrow auto-repeat while held
+    if (_altRepCh && !_menu && !_book) {
+      if (!(st.alt && std::find(st.word.begin(), st.word.end(), _altRepCh) != st.word.end())) _altRepCh = 0;
+      else if (now >= _altRepAt) { altKey(_altRepCh); _altRepAt = now + 60; }
     }
 
     if (cnt != _lastCnt) {
@@ -1250,18 +1399,99 @@ private:
     if (_viewOff > 0) { _viewOff++; if (_viewOff > _histCount) _viewOff = _histCount; }
   }
 
+  // Alternate screen (full-screen apps): the normal screen is saved and restored.
+  void setAlt(bool on) {
+    if (on && !_altScr) {
+      memcpy(_altBuf, _scr, sizeof(_scr));
+      _altRow = _row; _altCol = _col; _altScr = true;
+      clearAll(); _row = _col = 0;
+    } else if (!on && _altScr) {
+      memcpy(_scr, _altBuf, sizeof(_scr));
+      _row = _altRow; _col = _altCol; _altScr = false;
+      _regTop = 0; _regBot = _rows - 1;
+    }
+  }
+
   void scrollUp() {
-    pushHistory(_scr[0]);
+    if (!_altScr) pushHistory(_scr[0]);
     memmove(_scr[0], _scr[1], sizeof(Cell) * MAXC * (_rows - 1));
     clearCells(_rows - 1, 0, MAXC);
   }
 
+  void regionFix() { if (_regBot >= _rows || _regTop > _regBot) { _regTop = 0; _regBot = _rows - 1; } }
+
+  // Scrolls the scroll region up (n rows). Only a full-screen scroll feeds the scrollback.
+  void regionUp(int n) {
+    regionFix();
+    for (int k = 0; k < n; k++) {
+      if (_regTop == 0 && _regBot == _rows - 1) { scrollUp(); continue; }
+      memmove(_scr[_regTop], _scr[_regTop + 1], sizeof(Cell) * MAXC * (_regBot - _regTop));
+      clearCells(_regBot, 0, MAXC);
+    }
+  }
+  void regionDown(int n) {
+    regionFix();
+    for (int k = 0; k < n; k++) {
+      memmove(_scr[_regTop + 1], _scr[_regTop], sizeof(Cell) * MAXC * (_regBot - _regTop));
+      clearCells(_regTop, 0, MAXC);
+    }
+  }
+  void insLines(int n) {                       // CSI L
+    regionFix();
+    if (_row < _regTop || _row > _regBot) return;
+    int avail = _regBot - _row + 1;
+    if (n > avail) n = avail;
+    memmove(_scr[_row + n], _scr[_row], sizeof(Cell) * MAXC * (avail - n));
+    for (int k = 0; k < n; k++) clearCells(_row + k, 0, MAXC);
+    _col = 0;
+  }
+  void delLines(int n) {                       // CSI M
+    regionFix();
+    if (_row < _regTop || _row > _regBot) return;
+    int avail = _regBot - _row + 1;
+    if (n > avail) n = avail;
+    memmove(_scr[_row], _scr[_row + n], sizeof(Cell) * MAXC * (avail - n));
+    for (int k = 0; k < n; k++) clearCells(_regBot - k, 0, MAXC);
+    _col = 0;
+  }
+  void insChars(int n) {                       // CSI @
+    int c = clampCol(_col);
+    if (n > _cols - c) n = _cols - c;
+    memmove(&_scr[_row][c + n], &_scr[_row][c], sizeof(Cell) * (_cols - c - n));
+    clearCells(_row, c, c + n);
+  }
+  void delChars(int n) {                       // CSI P
+    int c = clampCol(_col);
+    if (n > _cols - c) n = _cols - c;
+    memmove(&_scr[_row][c], &_scr[_row][c + n], sizeof(Cell) * (_cols - c - n));
+    clearCells(_row, _cols - n, _cols);
+  }
+  void reverseIndex() {                        // ESC M
+    regionFix();
+    if (_row == _regTop) regionDown(1); else if (_row > 0) _row--;
+  }
+
   void newline() {                 // like a tty with onlcr: LF = CR + LF
     _col = 0;
-    if (++_row >= _rows) { _row = _rows - 1; scrollUp(); }
+    regionFix();
+    if (_row == _regBot) regionUp(1);
+    else if (++_row >= _rows) _row = _rows - 1;
+  }
+
+  // VT100 line-drawing characters (ESC ( 0) -> CP437 glyphs
+  static uint8_t acsGlyph(uint8_t c) {
+    switch (c) {
+      case 'j': return 0xD9; case 'k': return 0xBF; case 'l': return 0xDA; case 'm': return 0xC0;
+      case 'n': return 0xC5; case 'q': case 'o': case 'p': case 'r': case 's': return 0xC4;
+      case 't': return 0xC3; case 'u': return 0xB4; case 'v': return 0xC1; case 'w': return 0xC2;
+      case 'x': return 0xB3; case 'a': return 0xB1; case 'f': return 0xF8; case 'g': return 0xF1;
+      case '~': return 0xFA; case '`': return 0x04; case '0': return 0xDB;
+      default: return c;
+    }
   }
 
   void putPrintable(uint8_t c) {
+    if (_acs && c >= 0x60 && c <= 0x7E) c = acsGlyph(c);
     if (_col >= _cols) newline();   // "lazy" wrap, like real terminals
     _scr[_row][_col].c = c;
     _scr[_row][_col].a = _attr;
@@ -1347,8 +1577,18 @@ private:
   int P(int i, int def) const { return (i < _np && _p[i] > 0) ? _p[i] : def; }
 
   void csi(char f) {
-    if (_priv) {                               // ESC [ ? ... h/l
-      if ((f == 'h' || f == 'l') && _np >= 1 && _p[0] == 25) _curVisible = (f == 'h');
+    if (_priv) {                               // ESC [ ? ... h/l (several modes may be listed)
+      if (f == 'h' || f == 'l') {
+        bool on = (f == 'h');
+        for (int i = 0; i < _np; i++) {
+          switch (_p[i]) {
+            case 25: _curVisible = on; break;
+            case 1:  _appCursor = on; break;
+            case 47: case 1047: case 1049: setAlt(on); break;
+            default: break;
+          }
+        }
+      }
       return;
     }
     switch (f) {
@@ -1378,6 +1618,23 @@ private:
       }
       case 's': _saveRow = _row; _saveCol = _col; break;
       case 'u': _row = _saveRow; _col = _saveCol; break;
+      case 'E': _row = clampRow(_row + P(0, 1)); _col = 0; break;
+      case 'F': _row = clampRow(_row - P(0, 1)); _col = 0; break;
+      case 'L': insLines(P(0, 1)); break;
+      case 'M': delLines(P(0, 1)); break;
+      case '@': insChars(P(0, 1)); break;
+      case 'P': delChars(P(0, 1)); break;
+      case 'X': { int c = clampCol(_col); clearCells(_row, c, c + P(0, 1) > _cols ? _cols : c + P(0, 1)); break; }
+      case 'S': regionUp(P(0, 1)); break;
+      case 'T': regionDown(P(0, 1)); break;
+      case 'r': {                              // set scroll region
+        int t = P(0, 1) - 1, b = (_np >= 2 && _p[1] > 0) ? _p[1] - 1 : _rows - 1;
+        if (t < 0) t = 0;
+        if (b >= _rows) b = _rows - 1;
+        if (t < b) { _regTop = t; _regBot = b; } else { _regTop = 0; _regBot = _rows - 1; }
+        _row = 0; _col = 0;
+        break;
+      }
       default: break;                          // the rest is ignored
     }
   }
@@ -1481,12 +1738,13 @@ private:
         _pst = 0;
         if (c == '[') { _pst = 2; _np = 0; _priv = false; memset(_p, 0, sizeof(_p)); }
         else if (c == ']') _pst = 3;           // OSC: ignore until BEL / ESC
-        else if (c == '(' || c == ')' || c == '#') _pst = 4;
+        else if (c == '(' || c == ')' || c == '#') { _pst = 4; _chKind = (char)c; }
+        else if (c == 'M') reverseIndex();
         else if (c == '7') { _saveRow = _row; _saveCol = _col; }
         else if (c == '8') { _row = _saveRow; _col = _saveCol; }
         else if (c == 'D') newline();
         else if (c == 'E') newline();
-        else if (c == 'c') { _fg = 7; _bg = 0; _bold = _rev = false; updateAttr(); clearAll(); _row = _col = 0; }
+        else if (c == 'c') { _fg = 7; _bg = 0; _bold = _rev = false; updateAttr(); _appCursor = false; setAlt(false); clearAll(); _row = _col = 0; _regTop = 0; _regBot = _rows - 1; _acs = false; }
         _dirty = true;
         return;
       case 2:                                  // inside a CSI sequence
@@ -1516,6 +1774,7 @@ private:
         return;
       case 4:                                  // ESC ( x  /  ESC # x
         _pst = 0;
+        if (_chKind == '(') _acs = (c == '0');   // VT100 line drawing on/off
         return;
       default: break;
     }
@@ -1553,7 +1812,7 @@ private:
     view = _viewOff; hist = _histCount; row = _row; col = _col; curVis = _curVisible; cols = _cols; pet = _pet;
     panX = wide80() ? _panX : 0;
     if (_panY > _rows - ROWS) _panY = _rows - ROWS;
-    if (view == 0 && _rows > ROWS && row != _lastCurRow) {       // the window follows the cursor
+    if (view == 0 && _rows > ROWS && !_panYHold && row != _lastCurRow) {       // the window follows the cursor
       _lastCurRow = row;
       if (row < _panY) _panY = row; else if (row >= _panY + ROWS) _panY = row - ROWS + 1;
     }
@@ -1748,41 +2007,58 @@ private:
     _canvas.drawString("Up/Down item  Left/Right value  Esc exit", 4, BAR_Y - 1);
   }
 
-  // BBS phonebook (full screen).
+  // Phonebooks (full screen).
   void drawBook() {
     const uint16_t TXT = 0xC618, SEL = 0x39E7, DIM = 0x7BEF;
+    const int nf = bkN(_bk);
+    char (*ents)[B_MAXF][B_FLEN + 1] = _bd[_bk];
     _canvas.fillSprite(TFT_BLACK);
     _canvas.fillRect(0, 0, 240, 10, (uint16_t)0x001F);
     _canvas.setTextColor((uint16_t)0xFFFF);
     char t[32];
-    if (_bEdit) snprintf(t, sizeof(t), "EDIT SLOT %d", _bSel + 1); else snprintf(t, sizeof(t), "BBS PHONEBOOK");
+    if (_bEdit) snprintf(t, sizeof(t), "EDIT %s %d", _bk ? "SSH" : "BBS", _bSel + 1);
+    else snprintf(t, sizeof(t), "%s PHONEBOOK", _bk ? "SSH" : "BBS");
     _canvas.drawString(t, 4, 1);
     if (_bEdit) {
-      for (int f = 0; f < 2; f++) {
-        int y = 16 + f * 40;
-        _canvas.setTextColor(f == _bField ? (uint16_t)0xFFE0 : TXT);
-        _canvas.drawString(f ? "Address (host or host:port)" : "Nome", 4, y);
-        _canvas.fillRect(2, y + 11, 236, 12, f == _bField ? SEL : (uint16_t)0x2104);
-        char b[B_ADDR + 2];
-        snprintf(b, sizeof(b), "%s%s", f ? _eAddr : _eName, f == _bField ? "_" : "");
+      if (_bMsg[0]) { _canvas.setTextColor((uint16_t)0xFFE0); _canvas.drawString(_bMsg, 120, 1); }
+      const int stride = (nf == 2) ? 40 : 21;
+      for (int f = 0; f < nf; f++) {
+        int y = 13 + f * stride;
+        bool act = (f == _bField);
+        _canvas.setTextColor(act ? (uint16_t)0xFFE0 : TXT);
+        _canvas.drawString(bkLbl(_bk, f), 4, y);
+        _canvas.fillRect(2, y + 9, 236, 11, act ? SEL : (uint16_t)0x2104);
+        char b[B_FLEN + 2];
+        if (_bk && f == 2 && !act) {                       // password: masked unless being edited
+          size_t l = strlen(_be[f]); if (l > B_FLEN) l = B_FLEN;
+          memset(b, '*', l); b[l] = 0;
+        } else {
+          snprintf(b, sizeof(b), "%s%s", _be[f], act ? "_" : "");
+        }
         _canvas.setTextColor((uint16_t)0xFFFF);
-        _canvas.drawString(b, 4, y + 13);
+        _canvas.drawString(b, 4, y + 11);
       }
     } else {
       for (int i = 0; i < B_N; i++) {
         int y = 11 + i * 9;
         if (i == _bSel) _canvas.fillRect(0, y - 1, 240, 9, SEL);
-        char b[B_NAME + 8];
-        snprintf(b, sizeof(b), "%d %s", i + 1, _bName[i][0] ? _bName[i] : (_bAddr[i][0] ? "-" : "(empty)"));
-        _canvas.setTextColor(_bName[i][0] || _bAddr[i][0] ? (uint16_t)0xFFFF : DIM);
+        bool used = false;
+        for (int f = 0; f < nf; f++) if (ents[i][f][0]) used = true;
+        char b[B_FLEN + 8];
+        snprintf(b, sizeof(b), "%d %s", i + 1, ents[i][0][0] ? ents[i][0] : (used ? "-" : "(empty)"));
+        _canvas.setTextColor(used ? (uint16_t)0xFFFF : DIM);
         _canvas.drawString(b, 6, y);
       }
+      char a[96];
+      if (!_bk) snprintf(a, sizeof(a), "%s", ents[_bSel][1]);
+      else if (ents[_bSel][1][0] || ents[_bSel][3][0])
+        snprintf(a, sizeof(a), "%s@%s%s%s", ents[_bSel][1], ents[_bSel][3], ents[_bSel][4][0] ? ":" : "", ents[_bSel][4]);
+      else a[0] = 0;
+      a[38] = 0;
       _canvas.setTextColor((uint16_t)0x07FF);
-      char a[B_ADDR + 8];
-      snprintf(a, sizeof(a), "%s", _bAddr[_bSel][0] ? _bAddr[_bSel] : "");
       _canvas.drawString(a, 4, 103);
+      if (_bMsg[0]) { _canvas.setTextColor((uint16_t)0xFFE0); _canvas.drawString(_bMsg, 4, 115); }
     }
-    if (_bMsg[0]) { _canvas.setTextColor((uint16_t)0xFFE0); _canvas.drawString(_bMsg, 4, 115); }
     _canvas.fillRect(0, BAR_Y - 2, 240, BAR_H + 2, (uint16_t)0x2104);
     _canvas.setTextColor(TXT);
     _canvas.drawString(_bEdit ? "Up/Down field  Enter save  Esc cancel" : "Enter call  Tab edit  Esc exit", 4, BAR_Y - 1);

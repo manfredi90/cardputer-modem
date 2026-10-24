@@ -15,6 +15,7 @@
    limitations under the License.
 */
 #include "Arduino.h"
+#include "esp_heap_caps.h"
 #include "IPAddress.h"
 #include <WiFi.h>
 #include "src/libssh2/libssh2_config.h"

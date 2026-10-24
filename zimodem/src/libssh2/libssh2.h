@@ -766,7 +766,7 @@ LIBSSH2_API int libssh2_poll(LIBSSH2_POLLFD *fds, unsigned int nfds,
 
 /* Channel API */
 #define LIBSSH2_CHANNEL_WINDOW_DEFAULT  (2*1024*1024)
-#define LIBSSH2_CHANNEL_PACKET_DEFAULT  32768
+#define LIBSSH2_CHANNEL_PACKET_DEFAULT  4096   /* was 32768: smaller RAM use on ESP32 */
 #define LIBSSH2_CHANNEL_MINADJUST       1024
 
 /* Extended Data Handling */
