@@ -765,7 +765,11 @@ LIBSSH2_API int libssh2_poll(LIBSSH2_POLLFD *fds, unsigned int nfds,
                              long timeout);
 
 /* Channel API */
-#define LIBSSH2_CHANNEL_WINDOW_DEFAULT  (2*1024*1024)
+/* Zimodem/ESP32: was 2 MB. libssh2 reads every packet the server sends and queues it
+ * in RAM until Zimodem consumes it (at the serial baud rate), so a 2 MB window let a
+ * full-screen redraw (e.g. mc) fill the heap: "esp-aes: Failed to allocate memory",
+ * stalls and panics. A small window makes the server wait instead. */
+#define LIBSSH2_CHANNEL_WINDOW_DEFAULT  (8*1024)
 #define LIBSSH2_CHANNEL_PACKET_DEFAULT  4096   /* was 32768: smaller RAM use on ESP32 */
 #define LIBSSH2_CHANNEL_MINADJUST       1024
 

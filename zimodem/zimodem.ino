@@ -769,7 +769,8 @@ void checkFactoryReset()
 void loop() 
 {
 #ifdef ZIMODEM_CARDPUTER
-  HWSerial.pump();   // keyboard + display
+  HWSerial.setCmdMode(currMode == &commandMode);   // dial / AT&W only in command mode
+  HWSerial.pump();   // applies UART pin changes made in the menu
   {
     unsigned long nb = HWSerial.takeBaudRequest();   // baud rate chosen in the menu
     if(nb > 0)

@@ -13,7 +13,7 @@
  *  - real-time terminal: keyboard and display run in a dedicated FreeRTOS
  *    task (core 0), so the screen keeps scrolling even while Zimodem is
  *    busy in long/blocking loops
- *  - scrollback (CARDPUTER_SCROLLBACK_LINES rows), status bar (WiFi, baud,
+ *  - scrollback (0/50/100/200 rows, chosen in the menu), status bar (WiFi, baud,
  *    call state), ANSI colors (16 colors, SGR) and basic cursor/erase codes
  *  - encodings: CP437 (DOS), UTF-8 and PETSCII (C64 colors, cursor, reverse,
  *    graphic symbols); outside a call PETSCII is shown as plain ASCII so
@@ -28,6 +28,8 @@
  *  - when the baud rate is changed in the menu, "AT&W" is sent to Zimodem
  *    (if no call is open) so that it is saved in its configuration
  *  - pull-up on the RX pin (a floating RX produced random characters)
+ *  - optional composite TV output, 240p PAL/NTSC, monochrome (2 pins) or 6 grey levels
+ *    (3 pins) (see CardputerCVBS.h)
  *
  * Must be included BEFORE any Zimodem #define (in particular
  * "#define null 0"), because the M5 libraries don't like it.
@@ -61,6 +63,8 @@
 #endif
 #include <vector>
 #include <algorithm>
+#include <stdlib.h>
+#include "CardputerCVBS.h"
 
 // SSH (libssh2) and PPP/SLIP need more than the default 8 KB loop task stack.
 // Defined here, not in the .ino: the Arduino IDE inserts its auto-generated
@@ -74,9 +78,6 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 #endif
 #ifndef CARDPUTER_MODEM_TX
 #define CARDPUTER_MODEM_TX 2   // Grove G2
-#endif
-#ifndef CARDPUTER_SCROLLBACK_LINES
-#define CARDPUTER_SCROLLBACK_LINES 300   // 2 bytes per cell: 300 rows = 24 KB
 #endif
 // "Normal" text color (ANSI 37 / default). 0x07E0 = phosphor green as
 // before; use 0xAD55 for the "authentic" ANSI gray.
@@ -368,7 +369,18 @@ public:
   void end()                              { _uart.end(); _started = false; }
 
   // Number of open connections (shown in the status bar).
-  void setCalls(int n) { _calls = n; }
+  void setCalls(int n) {
+    int was = _calls;
+    _calls = n;
+    if (was > 0 && n == 0) {                   // call ended: drop modes the remote left behind
+      xSemaphoreTake(_termMux, portMAX_DELAY);
+      softReset(); _dirty = true;
+      xSemaphoreGive(_termMux);
+    }
+  }
+  // Zimodem's loop() tells us whether it is in command mode (dial strings and AT&W
+  // are only typed there, never into PPP/SLIP/config/shell modes).
+  void setCmdMode(bool on) { _cmdMode = on; }
 
   // Zimodem calls this function from its loop(): if a baud change is needed
   // (chosen in the menu, or saved) it returns the new value, otherwise 0.
@@ -381,7 +393,34 @@ public:
   }
 
   // Kept for compatibility: keyboard and display run in their own task.
-  void pump() {}
+  // Called from Zimodem's loop(): UART pin changes are applied here, in the same task
+  // that reads and writes the UART, not in the display task.
+  void pump() {
+    if (_pinsReq) { _pinsReq = false; applyPins(); }
+    if (_video != _videoApplied || (_video && _vw != _vwApplied)) applyVideo();
+    if (_videoPalDirty) { _videoPalDirty = false; cvbs::setPalettes(_pal, _palPet); }
+  }
+
+  // Starts / stops the TV output (Zimodem's task: the video interrupt then runs on its core,
+  // not on core 0 with the display task and WiFi).
+  void applyVideo() {
+    uint8_t want = _video;
+    _videoApplied = want; _vwApplied = _vw;
+    cvbs::stop();
+    if (!want) return;
+    if (tvPin(_rx, want) || tvPin(_tx, want) || s_origBoard) {
+      _video = _videoApplied = 0;
+      snprintf(_note, sizeof(_note), "TV PINS IN USE"); _noteUntil = millis() + 4000; _dirty = true;
+      return;
+    }
+    cvbs::g_src.cells = (const uint8_t *)&_scr[0][0];
+    cvbs::g_src.stride = (int)sizeof(_scr[0]);
+    cvbs::g_src.rows = _rows; cvbs::g_src.cols = _cols; cvbs::g_src.pet = _pet;
+    if (!cvbs::start((want - 1) % 2 + 1, want >= 3, _vw, _vx, _vy, CPMS_BOX, CPMS_PET, _pal, _palPet)) {
+      _video = _videoApplied = 0;
+      snprintf(_note, sizeof(_note), "TV OUT FAILED"); _noteUntil = millis() + 4000; _dirty = true;
+    }
+  }
 
   // Size of the virtual screen, reported to SSH servers as the pty size.
   int termCols() const { return _cols; }
@@ -390,7 +429,7 @@ public:
   void setSshTerm(bool on) {
     if (on) return;
     xSemaphoreTake(_termMux, portMAX_DELAY);
-    _appCursor = false; setAlt(false); _dirty = true;
+    softReset(); _dirty = true;
     xSemaphoreGive(_termMux);
   }
   // Shows a line on the display after an abnormal reset (crash, watchdog, brownout),
@@ -515,7 +554,9 @@ private:
   int _viewOff = 0;              // 0 = live, >0 = rows back in scrollback
   int _row = 0, _col = 0;        // _col == COLS means "wrap pending"
   int _regTop = 0, _regBot = ROWS - 1;   // scroll region (CSI r), rows inclusive
-  bool _acs = false;             // ESC ( 0 : VT100 line-drawing set active
+  bool _acs = false;             // G0 is the VT100 line-drawing set (ESC ( 0)
+  bool _g1Acs = false;           // G1 is the line-drawing set (ESC ) 0)
+  bool _useG1 = false;           // SO (0x0E) selected G1, SI (0x0F) back to G0
   char _chKind = 0;              // which of ESC ( ESC ) ESC # is being parsed
   int _saveRow = 0, _saveCol = 0;
   bool _curVisible = true;
@@ -542,6 +583,10 @@ private:
   uint8_t _fgIdx = 0;
   int _cfgRx = CARDPUTER_MODEM_RX, _cfgTx = CARDPUTER_MODEM_TX;
   bool _pinsSaved = false;
+  volatile bool _pinsReq = false;    // pin change waiting for pump()
+  volatile bool _cmdMode = true;     // Zimodem is in command mode
+  static bool s_origBoard;           // original Cardputer (keyboard on GPIOs)
+  uint8_t _saveFg = 7, _saveBg = 0; bool _saveBold = false, _saveRev = false, _saveAcs = false, _saveG1 = false;
   bool _uartIn = true;             // false = ignore bytes arriving from the UART
   unsigned long _cfgBaud = 0;      // baud chosen in the menu (0 = not set)
   bool _baudTouched = false;
@@ -553,7 +598,17 @@ private:
   volatile unsigned long _reqBaud = 0;   // baud change request for the Zimodem loop
   bool _menu = false;
   uint8_t _mSel = 0;
-  enum { M_N = 9 };
+  enum { M_N = 12 };
+  uint8_t _video = 0;            // TV output: 0 off, 1 PAL, 2 NTSC, 3 PAL 6 greys, 4 NTSC 6 greys
+  uint8_t _videoApplied = 0;     // what pump() has actually started
+  int8_t _vx = 0, _vy = 0;       // TV picture position (calibration)
+  uint8_t _vw = cvbs::CLOCK_DEF; // TV pixel clock (index into cvbs::CLOCKS): sets the picture width
+  uint8_t _vwApplied = 0;
+  bool _calib = false;           // TV calibration screen open
+  volatile bool _videoPalDirty = false;
+  uint8_t _sbIdx = 2;            // scrollback size: index into sbLines() (default 100 rows = 16 KB:
+                                 // with 300 rows an SSH session ran out of RAM)
+  uint8_t _sbIdxApplied = 255;
 
   // phonebooks, saved in NVS. Kind 0: BBS (name, host[:port]) dialed with ATDT.
   // Kind 1: SSH (name, user, password, host, port) dialed with ATDS"user:pass@host:port".
@@ -604,27 +659,41 @@ private:
     static const char *n[NCOL] = { "Default", "Green", "Amber", "White", "Gray", "Cyan", "Yellow" };
     return n[(i >= 0 && i < NCOL) ? i : 0];
   }
-  // Free GPIOs on Cardputer ADV (excluding display, SD, keyboard/I2C, audio, IR, USB, flash, G0)
+  // Free GPIOs (excluding display, SD, keyboard/I2C, audio, IR, USB, flash, G0).
+  // The original Cardputer scans its keyboard on GPIO 3-7, 13, 15 and reads the battery on 10.
+  // With CARDPUTER_USE_CTRL_PINS, 3-7 and 13 are the modem control lines.
   static const uint8_t *pinList(int &n) {
-    static const uint8_t p[] = { 1, 2, 3, 4, 5, 6, 7, 10, 13, 15, 16, 17, 18, 21, 47, 48 };
-    n = (int)sizeof(p);
-    return p;
+#ifdef CARDPUTER_USE_CTRL_PINS
+    static const uint8_t adv[] = { 1, 2, 10, 15, 16, 17, 18, 21, 47, 48 };
+#else
+    static const uint8_t adv[] = { 1, 2, 3, 4, 5, 6, 7, 10, 13, 15, 16, 17, 18, 21, 47, 48 };
+#endif
+    static const uint8_t orig[] = { 1, 2, 16, 17, 18, 21, 47, 48 };
+    if (s_origBoard) { n = (int)sizeof(orig); return orig; }
+    n = (int)sizeof(adv);
+    return adv;
   }
   static bool pinOk(int v) {
     int n; const uint8_t *p = pinList(n);
     for (int i = 0; i < n; i++) if (p[i] == v) return true;
     return false;
   }
-  static int nextPin(int cur, int d, int other) {
+  static int nextPin(int cur, int d, int other, int tvMode = 0) {
     int n; const uint8_t *p = pinList(n);
     int i = 0;
     for (; i < n; i++) if (p[i] == cur) break;
     if (i == n) i = 0;
     for (int k = 0; k < n; k++) {
       i = (i + d + n) % n;
-      if (p[i] != other) return p[i];
+      if (p[i] == other) continue;
+      if (tvMode && tvPin(p[i], tvMode)) continue;
+      return p[i];
     }
     return cur;
+  }
+  // Pins used by the TV output in mode v (1/2 mono: 2 pins, 3/4 grey: 3 pins).
+  static bool tvPin(int p, int v = 1) {
+    return p == CARDPUTER_CVBS_PIN_VIDEO || p == CARDPUTER_CVBS_PIN_SYNC || (v >= 3 && p == CARDPUTER_CVBS_PIN_LSB);
   }
 
   static const unsigned long *baudList(int &n) {
@@ -658,9 +727,17 @@ private:
     _tall = _prefs.getBool("t", true);
     _uartIn = _prefs.getBool("ri", true);
     uint8_t e = _prefs.getUChar("e", _utf8 ? 1 : 0);
+    _video = _prefs.getUChar("v", 0); if (_video > 4) _video = 0;
+    _vx = (int8_t)_prefs.getUChar("vx", 0); _vy = (int8_t)_prefs.getUChar("vy", 0);
+    _vw = _prefs.getUChar("vc", cvbs::CLOCK_DEF);           // "vc": clock index (was "vw": 0.1 MHz)
+    if (_vw >= cvbs::NCLOCKS) _vw = cvbs::CLOCK_DEF;
+    if (_vx < -cvbs::XOFF_MAX || _vx > cvbs::XOFF_MAX) _vx = 0;
+    if (_vy < -cvbs::YOFF_MAX || _vy > cvbs::YOFF_MAX) _vy = 0;
+    _sbIdx = _prefs.getUChar("sb", 2); if (_sbIdx > 3) _sbIdx = 2;   // 300 rows (old index 4) is gone
     _prefs.end();
     _wide = w;
     _rows = _tall ? MAXR : ROWS;
+    _regTop = 0; _regBot = _rows - 1;          // scroll region = whole screen (it was left at 16 rows)
     setEncRaw(e <= 2 ? e : 0);                 // also applies the columns
     _fgIdx = (c < NCOL) ? c : 0;
     _pal[7] = colorOf(_fgIdx);
@@ -706,6 +783,9 @@ private:
     _prefs.putUChar("rx", (uint8_t)_cfgRx);
     _prefs.putUChar("tx", (uint8_t)_cfgTx);
     _prefs.putUChar("e", (uint8_t)encoding());
+    _prefs.putUChar("sb", _sbIdx);
+    _prefs.putUChar("v", _video);
+    _prefs.putUChar("vx", (uint8_t)_vx); _prefs.putUChar("vy", (uint8_t)_vy); _prefs.putUChar("vc", _vw);
     _prefs.end();
     _pinsSaved = true;
   }
@@ -753,7 +833,7 @@ private:
     if (want < _rows) {
       int extra = _rows - want;
       for (int i = 0; i < extra; i++) {
-        pushHistory(_scr[0]);
+        if (!_altScr) pushHistory(_scr[0]);
         memmove(_scr[0], _scr[1], sizeof(Cell) * MAXC * (_rows - 1));
         Cell b = blank();
         for (int c = 0; c < MAXC; c++) _scr[_rows - 1][c] = b;
@@ -781,6 +861,7 @@ private:
     bool wasPet = _pet;
     _utf8 = (e == 1); _pet = (e == 2);
     _u8need = 0; _pst = 0;
+    _acs = false; _g1Acs = false; _useG1 = false; _regTop = 0; _regBot = _rows - 1;   // ANSI-only state must not leak into PETSCII
     if (_pet != wasPet) {                      // starting colors/attributes of the new mode
       _rev = false; _bold = false; _bg = 0; _petLower = false;
       _fg = _pet ? 14 : 7;                     // C64: light blue; ANSI: default color
@@ -825,7 +906,8 @@ private:
     _cfgBaud = _baud; _baudAtOpen = _baud; _baudTouched = false;   // show the current baud
   }
   void closeMenu() {
-    _menu = false; applyPins();
+    _menu = false; _calib = false; cvbs::g_src.test = false;
+    if (_cfgRx != _rx || _cfgTx != _tx) _pinsReq = true;   // applied by pump() in Zimodem's loop
     if (_baudTouched && _cfgBaud && _cfgBaud != _baud) {
       portENTER_CRITICAL(&_kbMux); _reqBaud = _cfgBaud; portEXIT_CRITICAL(&_kbMux);
       _atwBaud = _cfgBaud; _atwAt = millis();
@@ -835,11 +917,24 @@ private:
         _atwPending = true;
       }
     }
+    allocHistory();                            // new scrollback size (if changed)
     saveSettings(); _dirty = true;
   }
 
   // act: 0 up, 1 down, 2 left, 3 right, 4 enter, 5 close
   void menuKey(int act) {
+    if (_calib) {                              // TV calibration: arrows move the picture
+      switch (act) {
+        case 0: if (_vy > -cvbs::YOFF_MAX) _vy--; break;
+        case 1: if (_vy <  cvbs::YOFF_MAX) _vy++; break;
+        case 2: if (_vx > -cvbs::XOFF_MAX) _vx -= 2; break;
+        case 3: if (_vx <  cvbs::XOFF_MAX) _vx += 2; break;
+        default: _calib = false; cvbs::g_src.test = false; break;   // Enter / Esc: back to the menu
+      }
+      cvbs::setOffsets(_vx, _vy);
+      _dirty = true;
+      return;
+    }
     switch (act) {
       case 0: _mSel = (_mSel + M_N - 1) % M_N; break;
       case 1: _mSel = (_mSel + 1) % M_N; break;
@@ -849,13 +944,34 @@ private:
         switch (_mSel) {
           case 0: setWide(!_wide); break;
           case 1: setTall(!_tall); break;
-          case 2: _fgIdx = (uint8_t)((_fgIdx + d + NCOL) % NCOL); _pal[7] = colorOf(_fgIdx); break;
-          case 3: _cfgRx = nextPin(_cfgRx, d, _cfgTx); break;
-          case 4: _cfgTx = nextPin(_cfgTx, d, _cfgRx); break;
+          case 2: _fgIdx = (uint8_t)((_fgIdx + d + NCOL) % NCOL); _pal[7] = colorOf(_fgIdx); _videoPalDirty = true; break;
+          case 3: _cfgRx = nextPin(_cfgRx, d, _cfgTx, _video); break;
+          case 4: _cfgTx = nextPin(_cfgTx, d, _cfgRx, _video); break;
           case 5: _cfgBaud = nextBaud(_cfgBaud ? _cfgBaud : _baud, d); _baudTouched = true; break;
           case 6: _uartIn = !_uartIn; break;
           case 7: cycleEncoding(d); break;
-          case 8: if (act == 4) { closeMenu(); return; } break;
+          case 8: _sbIdx = (uint8_t)((_sbIdx + d + 4) % 4); break;
+          case 9: {
+            uint8_t v = (uint8_t)((_video + d + 5) % 5);
+#ifdef CARDPUTER_USE_CTRL_PINS
+            if (v) { snprintf(_note, sizeof(_note), "TV: CTRL PINS"); _noteUntil = millis() + 3000; v = 0; }
+#endif
+            if (v && s_origBoard) {                    // the original Cardputer reads its keyboard on G3-G7
+              snprintf(_note, sizeof(_note), "TV: ADV ONLY"); _noteUntil = millis() + 3000; v = 0;
+            }
+            if (v && (tvPin(_cfgRx, v) || tvPin(_cfgTx, v))) {   // the UART is on the TV pins
+              snprintf(_note, sizeof(_note), "TV PINS IN USE"); _noteUntil = millis() + 3000; v = 0;
+            }
+            _video = v;
+            break;
+          }
+          case 10:                             // TV calibration
+            if (act == 4 || act == 3) {
+              if (!_video || !cvbs::running()) { snprintf(_note, sizeof(_note), "TV OUT IS OFF"); _noteUntil = millis() + 3000; }
+              else { _calib = true; cvbs::g_src.test = true; }
+            }
+            break;
+          case 11: if (act == 4) { closeMenu(); return; } break;
         }
       }
     }
@@ -880,13 +996,16 @@ private:
       std::vector<char> nw;
       newItems(_prevWord, st.word, nw, true);
       for (char c : nw) {
+        // width: a faster pixel clock makes the picture narrower (applied by pump(), restarts the output)
+        if (_calib && (c == '-' || c == '_')) { if (_vw + 1 < cvbs::NCLOCKS) _vw++; _dirty = true; continue; }
+        if (_calib && (c == '=' || c == '+')) { if (_vw > 0) _vw--; _dirty = true; continue; }
         if (c == ';') menuKey(0); else if (c == '.') menuKey(1);
         else if (c == ',') menuKey(2); else if (c == '/') menuKey(3);
         else if (c == '`' || (st.fn && (c == '1' || c == '!'))) { menuKey(5); return; }
       }
     }
     if (st.enter && !_prevEnter) menuKey(4);
-    if (st.del && !_prevDel && !st.fn) menuKey(5);
+    if (!st.fn && ((st.del && !_prevDel) || hidHas(nh, HID_BS))) menuKey(5);
   }
 
   // ---------------------------------------------------------- phonebooks
@@ -919,6 +1038,7 @@ private:
       snprintf(cmd, sizeof(cmd), "ATDS\"%s:%s@%s%s%s\"\r", e[1], e[2], e[3], e[4][0] ? ":" : "", e[4]);
     }
     if (_calls > 0) { snprintf(_bMsg, sizeof(_bMsg), "In call: ATH first"); return; }
+    if (!_cmdMode) { snprintf(_bMsg, sizeof(_bMsg), "Not in command mode"); return; }
     if ((int)strlen(cmd) > KB_BUF - (int)_kbCount) { snprintf(_bMsg, sizeof(_bMsg), "Keyboard busy"); return; }
     closeBook(); goLive();
     for (const char *c = cmd; *c; c++) kbPush((uint8_t)*c);   // always ASCII (we are outside a call)
@@ -986,6 +1106,39 @@ private:
     }
   }
 
+  // Scrollback sizes offered in the menu (each 100 rows = 16 KB of RAM; 300 rows left
+  // too little RAM for SSH sessions).
+  static int sbLines(int i) {
+    static const int v[4] = {0, 50, 100, 200};
+    return v[(i >= 0 && i < 4) ? i : 2];
+  }
+  // (Re)allocates the scrollback with the size chosen in the menu. The old content is dropped.
+  void allocHistory() {
+    if (_sbIdxApplied == _sbIdx) return;
+    if (_termMux) xSemaphoreTake(_termMux, portMAX_DELAY);
+    free(_hist); _hist = nullptr;
+    _histCap = sbLines(_sbIdx); _histHead = 0; _histCount = 0; _viewOff = 0;
+    if (_histCap > 0) {
+      _hist = (Cell *)malloc(sizeof(Cell) * MAXC * _histCap);
+      if (!_hist) _histCap = 0;
+      else { Cell b = blank(); for (size_t i = 0; i < (size_t)MAXC * _histCap; i++) _hist[i] = b; }
+    }
+    _sbIdxApplied = _sbIdx;
+    if (_termMux) xSemaphoreGive(_termMux);
+  }
+
+  // Free internal RAM, for the settings screen and the debug log.
+  static void memInfo(char *b, size_t n) {
+#ifdef ARDUINO_ARCH_ESP32
+    snprintf(b, n, "RAM free %uK, block %uK, min %uK",
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+             (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024),
+             (unsigned)(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL) / 1024));
+#else
+    snprintf(b, n, "RAM n/a");
+#endif
+  }
+
   // ------------------------------------------------------------- init
   void initPalette() {
     auto rgb = [](int r, int g, int b) -> uint16_t {
@@ -1010,6 +1163,9 @@ private:
   void initDisplay() {
     if (_inited) return;
     initPalette();
+#ifdef ARDUINO_ARCH_ESP32
+    s_origBoard = (M5.getBoard() == m5::board_t::board_M5Cardputer);   // pin list depends on it
+#endif
     loadSettings();
     _termMux = xSemaphoreCreateMutex();
     M5Cardputer.Display.setRotation(1);
@@ -1025,11 +1181,7 @@ private:
     _canvas.setTextWrap(false);
     _canvas.cp437(true);                     // glyphs 0x80..0xFF = CP437
 
-    _histCap = CARDPUTER_SCROLLBACK_LINES;
-    _hist = (Cell *)malloc(sizeof(Cell) * MAXC * _histCap);
-    if (!_hist) _histCap = 0;
-
-    if (_hist) { Cell b = blank(); for (size_t i = 0; i < (size_t)MAXC * _histCap; i++) _hist[i] = b; }
+    allocHistory();
     updateAttr();
     clearAll();
     _row = _col = 0;
@@ -1077,7 +1229,7 @@ private:
       snprintf(_note, sizeof(_note), "USE AT&W"); _noteUntil = now + 5000; _dirty = true;
       return;
     }
-    if (_reqBaud != 0 || _baud != _atwBaud || _kbCount != 0) return;
+    if (_reqBaud != 0 || _baud != _atwBaud || _kbCount != 0 || !_cmdMode) return;
     static const char cmd[] = "AT&W\r";
     for (const char *c = cmd; *c; c++) kbPush((uint8_t)*c);
     _atwPending = false;
@@ -1096,6 +1248,19 @@ private:
       _wifiOk = ok;
       strcpy(_ip, ip);
       _dirty = true;
+    }
+    // Debug: free RAM on the USB serial monitor every 5 s during a call.
+    static uint32_t lastMem = 0;
+    if (_calls > 0 && millis() - lastMem >= 5000) {
+      lastMem = millis();
+#ifdef ARDUINO_ARCH_ESP32
+      char mi[40]; memInfo(mi, sizeof(mi));
+      Serial.printf("[cardputer] %s\n", mi);
+      // warn on the status bar when SSH/TLS are close to running out of RAM
+      if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < 12 * 1024) {
+        snprintf(_note, sizeof(_note), "LOW RAM"); _noteUntil = millis() + 5000; _dirty = true;
+      }
+#endif
     }
     static int lastCalls = -1;
     static unsigned long lastBaud = 0;
@@ -1159,6 +1324,21 @@ private:
     static const uint8_t code[8] = {15, 17, 18, 19, 20, 21, 23, 24};
     int c = code[n - 5];
     kbPush('['); kbPush((uint8_t)('0' + c / 10)); kbPush((uint8_t)('0' + c % 10)); kbPush('~');
+  }
+
+  // Ctrl+key -> control code. The library gives the shifted symbol with Ctrl held.
+  static char ctrlChar(char c) {
+    if (isalpha((unsigned char)c)) return toupper((unsigned char)c) & 0x1F;
+    switch (c) {
+      case '@': case ' ': case '2': return 0x00;
+      case '[': case '{': return 0x1B;
+      case '\\': case '|': return 0x1C;
+      case ']': case '}': return 0x1D;
+      case '^': case '6': case '~': return 0x1E;
+      case '_': case '-': return 0x1F;
+      case '?': case '/': return 0x7F;
+      default: return c;
+    }
   }
 
   // Alt + arrow key (; . , /) -> cursor key, Alt + 1..9,0,-,= -> F1..F12. Returns true if mapped.
@@ -1310,9 +1490,9 @@ private:
           if (c == ';' || c == '.' || c == ',' || c == '/') { _altRepCh = c; _altRepAt = now + 400; }
           continue;
         }
-        if (!petKeys()) { kbPush(0x1B); kbPush((uint8_t)c); continue; }
+        if (!petKeys()) { kbPush(0x1B); kbPush((uint8_t)(st.ctrl ? ctrlChar(c) : c)); continue; }
       }
-      if (st.ctrl && isalpha((unsigned char)c)) c = toupper((unsigned char)c) & 0x1F;
+      if (st.ctrl) c = ctrlChar(c);
       kbPush(petKeys() ? petKeyOut((uint8_t)c) : (uint8_t)c);
       any = true;
     }
@@ -1359,8 +1539,12 @@ private:
       else if (now >= _altRepAt) { altKey(_altRepCh); _altRepAt = now + 60; }
     }
 
-    if (cnt != _lastCnt) {
-      if (cnt > _lastCnt) onPress(st, now);   // new keys pressed
+    bool changed = (cnt != _lastCnt) || st.word != _prevWord || st.hid_keys != _prevHid ||
+                   st.enter != _prevEnter || st.tab != _prevTab || st.del != _prevDel;
+    if (changed) {
+      // new keys pressed; also a key released and another pressed within the same poll.
+      // Not on releases (count going down), so letting go of Shift does not retype 'a'.
+      if (cnt > _lastCnt || (cnt == _lastCnt && (st.word != _prevWord || st.hid_keys != _prevHid))) onPress(st, now);
       _prevWord = st.word;
       _prevHid = st.hid_keys;
       _prevEnter = st.enter; _prevTab = st.tab; _prevDel = st.del;
@@ -1377,7 +1561,7 @@ private:
     _attr = (uint8_t)((b << 4) | f);
   }
 
-  Cell blank() const { Cell c; c.c = ' '; c.a = (uint8_t)((_bg << 4) | 7); return c; }
+  Cell blank() const { Cell c; c.c = ' '; c.a = (uint8_t)((_bg << 4) | (_pet ? 14 : 7)); return c; }
 
   void clearAll() {
     Cell b = blank();
@@ -1399,6 +1583,16 @@ private:
     if (_viewOff > 0) { _viewOff++; if (_viewOff > _histCount) _viewOff = _histCount; }
   }
 
+  // Back to a clean state (end of a call/SSH session, ESC c, encoding change): attributes,
+  // line drawing, scroll region, cursor visibility, cursor keys, alternate screen.
+  void softReset() {
+    setAlt(false);
+    _rev = false; _bold = false; _bg = 0; _fg = _pet ? 14 : 7; updateAttr();
+    _acs = false; _g1Acs = false; _useG1 = false; _appCursor = false; _curVisible = true; _pst = 0; _u8need = 0;
+    _regTop = 0; _regBot = _rows - 1;
+    if (_row >= _rows) _row = _rows - 1;
+  }
+
   // Alternate screen (full-screen apps): the normal screen is saved and restored.
   void setAlt(bool on) {
     if (on && !_altScr) {
@@ -1408,6 +1602,9 @@ private:
     } else if (!on && _altScr) {
       memcpy(_scr, _altBuf, sizeof(_scr));
       _row = _altRow; _col = _altCol; _altScr = false;
+      if (_row >= _rows) _row = _rows - 1;          // rows may have changed meanwhile
+      if (_col > _cols) _col = _cols;
+      if (_saveRow >= _rows) _saveRow = _rows - 1;
       _regTop = 0; _regBot = _rows - 1;
     }
   }
@@ -1455,13 +1652,15 @@ private:
     _col = 0;
   }
   void insChars(int n) {                       // CSI @
-    int c = clampCol(_col);
+    if (_col >= _cols) _col = _cols - 1;       // clears a pending wrap, like xterm
+    int c = _col;
     if (n > _cols - c) n = _cols - c;
     memmove(&_scr[_row][c + n], &_scr[_row][c], sizeof(Cell) * (_cols - c - n));
     clearCells(_row, c, c + n);
   }
   void delChars(int n) {                       // CSI P
-    int c = clampCol(_col);
+    if (_col >= _cols) _col = _cols - 1;
+    int c = _col;
     if (n > _cols - c) n = _cols - c;
     memmove(&_scr[_row][c], &_scr[_row][c + n], sizeof(Cell) * (_cols - c - n));
     clearCells(_row, _cols - n, _cols);
@@ -1469,6 +1668,15 @@ private:
   void reverseIndex() {                        // ESC M
     regionFix();
     if (_row == _regTop) regionDown(1); else if (_row > 0) _row--;
+  }
+
+  void saveCursor() {
+    _saveRow = _row; _saveCol = _col;
+    _saveFg = _fg; _saveBg = _bg; _saveBold = _bold; _saveRev = _rev; _saveAcs = _acs; _saveG1 = _useG1;
+  }
+  void restoreCursor() {
+    _row = _saveRow < _rows ? _saveRow : _rows - 1; _col = _saveCol > _cols ? _cols : _saveCol;
+    _fg = _saveFg; _bg = _saveBg; _bold = _saveBold; _rev = _saveRev; _acs = _saveAcs; _useG1 = _saveG1; updateAttr();
   }
 
   void newline() {                 // like a tty with onlcr: LF = CR + LF
@@ -1491,7 +1699,7 @@ private:
   }
 
   void putPrintable(uint8_t c) {
-    if (_acs && c >= 0x60 && c <= 0x7E) c = acsGlyph(c);
+    if ((_useG1 ? _g1Acs : _acs) && !_pet && c >= 0x60 && c <= 0x7E) c = acsGlyph(c);
     if (_col >= _cols) newline();   // "lazy" wrap, like real terminals
     _scr[_row][_col].c = c;
     _scr[_row][_col].a = _attr;
@@ -1616,8 +1824,8 @@ private:
         else             clearCells(_row, 0, _cols);
         break;
       }
-      case 's': _saveRow = _row; _saveCol = _col; break;
-      case 'u': _row = _saveRow; _col = _saveCol; break;
+      case 's': saveCursor(); break;
+      case 'u': restoreCursor(); break;
       case 'E': _row = clampRow(_row + P(0, 1)); _col = 0; break;
       case 'F': _row = clampRow(_row - P(0, 1)); _col = 0; break;
       case 'L': insLines(P(0, 1)); break;
@@ -1625,13 +1833,28 @@ private:
       case '@': insChars(P(0, 1)); break;
       case 'P': delChars(P(0, 1)); break;
       case 'X': { int c = clampCol(_col); clearCells(_row, c, c + P(0, 1) > _cols ? _cols : c + P(0, 1)); break; }
-      case 'S': regionUp(P(0, 1)); break;
-      case 'T': regionDown(P(0, 1)); break;
+      case 'n':                                // device status report
+        // Answers go into the keyboard ring, so Zimodem sends them to the remote.
+        // Only during a call: in command mode Zimodem would read them as typed text.
+        if (_calls > 0) {
+          char b[16];
+          if (P(0, 0) == 6) {                    // cursor position: ESC [ row ; col R (1-based)
+            int c = (_col >= _cols ? _cols - 1 : _col) + 1;
+            snprintf(b, sizeof(b), "\x1b[%d;%dR", _row + 1, c);
+          } else if (P(0, 0) == 5) {             // status: ESC [ 0 n = OK
+            snprintf(b, sizeof(b), "\x1b[0n");
+          } else break;
+          for (const char *q = b; *q; q++) kbPush((uint8_t)*q);
+        }
+        break;
+      case 'S': regionUp(P(0, 1) > _rows ? _rows : P(0, 1)); break;
+      case 'T': regionDown(P(0, 1) > _rows ? _rows : P(0, 1)); break;
       case 'r': {                              // set scroll region
         int t = P(0, 1) - 1, b = (_np >= 2 && _p[1] > 0) ? _p[1] - 1 : _rows - 1;
         if (t < 0) t = 0;
         if (b >= _rows) b = _rows - 1;
-        if (t < b) { _regTop = t; _regBot = b; } else { _regTop = 0; _regBot = _rows - 1; }
+        if (t >= b) break;                     // invalid region: ignored, like xterm
+        _regTop = t; _regBot = b;
         _row = 0; _col = 0;
         break;
       }
@@ -1740,11 +1963,11 @@ private:
         else if (c == ']') _pst = 3;           // OSC: ignore until BEL / ESC
         else if (c == '(' || c == ')' || c == '#') { _pst = 4; _chKind = (char)c; }
         else if (c == 'M') reverseIndex();
-        else if (c == '7') { _saveRow = _row; _saveCol = _col; }
-        else if (c == '8') { _row = _saveRow; _col = _saveCol; }
-        else if (c == 'D') newline();
+        else if (c == '7') saveCursor();
+        else if (c == '8') restoreCursor();
+        else if (c == 'D') { int c0 = _col; newline(); _col = c0; }   // IND: down one line, same column
         else if (c == 'E') newline();
-        else if (c == 'c') { _fg = 7; _bg = 0; _bold = _rev = false; updateAttr(); _appCursor = false; setAlt(false); clearAll(); _row = _col = 0; _regTop = 0; _regBot = _rows - 1; _acs = false; }
+        else if (c == 'c') { softReset(); clearAll(); _row = _col = 0; }
         _dirty = true;
         return;
       case 2:                                  // inside a CSI sequence
@@ -1764,6 +1987,8 @@ private:
           _pst = 0;
           csi((char)c);
           _dirty = true;
+        } else if (c == 0x1B) {                // a new escape sequence starts
+          _pst = 1;
         } else {                               // unexpected control char: abort the sequence
           _pst = 0;
         }
@@ -1774,7 +1999,8 @@ private:
         return;
       case 4:                                  // ESC ( x  /  ESC # x
         _pst = 0;
-        if (_chKind == '(') _acs = (c == '0');   // VT100 line drawing on/off
+        if (_chKind == '(') _acs = (c == '0');         // G0: VT100 line drawing on/off
+        else if (_chKind == ')') _g1Acs = (c == '0');  // G1
         return;
       default: break;
     }
@@ -1789,10 +2015,17 @@ private:
     switch (c) {
       case '\r': _col = 0; break;
       case '\n': newline(); break;
-      case '\t': do { putPrintable(' '); } while (_col % 8 != 0 && _col < _cols); break;
+      case '\t': if (_col < _cols) { int t = (_col / 8 + 1) * 8; _col = t < _cols ? t : _cols - 1; } break;   // moves only
       case 8:
-      case 127:  if (_col > 0) { if (_col >= _cols) _col = _cols - 1; else _col--; _scr[_row][_col].c = ' '; } break;
+      case 127:
+        // Zimodem's command line echoes a bare BS, so there it erases; in a call it only moves
+        // the cursor (xterm/ncurses use ^H as "cursor left") and DEL does nothing.
+        if (_calls > 0) { if (c == 8 && _col > 0) { if (_col >= _cols) _col = _cols - 2; else _col--; if (_col < 0) _col = 0; } }
+        else if (_col > 0) { if (_col >= _cols) _col = _cols - 1; else _col--; _scr[_row][_col].c = ' '; }
+        break;
       case '\f': clearAll(); _row = _col = 0; break;
+      case 0x0E: _useG1 = true; break;           // SO: write with G1
+      case 0x0F: _useG1 = false; break;          // SI: back to G0
       default:
         if (c >= 32 && c < 127) putPrintable(c);
         break;
@@ -1810,6 +2043,10 @@ private:
     bool curVis, pet;
     xSemaphoreTake(_termMux, portMAX_DELAY);
     view = _viewOff; hist = _histCount; row = _row; col = _col; curVis = _curVisible; cols = _cols; pet = _pet;
+    // TV output: always the live screen, all the virtual rows/columns
+    cvbs::g_src.rows = _rows; cvbs::g_src.cols = _cols; cvbs::g_src.pet = _pet;
+    cvbs::g_src.curRow = row; cvbs::g_src.curCol = (col >= cols) ? cols - 1 : col;
+    cvbs::g_src.curOn = curVis && _blink;
     panX = wide80() ? _panX : 0;
     if (_panY > _rows - ROWS) _panY = _rows - ROWS;
     if (view == 0 && _rows > ROWS && !_panYHold && row != _lastCurRow) {       // the window follows the cursor
@@ -1965,6 +2202,7 @@ private:
 
   // Settings screen (full screen).
   void drawMenu() {
+    if (_calib) { drawCalib(); return; }
     const uint16_t TXT = 0xC618, SEL = 0x39E7;
     _canvas.fillSprite(TFT_BLACK);
     _canvas.fillRect(0, 0, 240, 10, (uint16_t)0x001F);
@@ -1972,10 +2210,11 @@ private:
     _canvas.drawString("SETTINGS", 4, 1);
     static const char *lab[M_N] = { "Virtual screen 80 col", "Virtual screen 25 rows", "Text color",
                                     "Pin UART RX (GPIO)", "Pin UART TX (GPIO)",
-                                    "Baud rate", "UART input", "Encoding", "Save and close" };
+                                    "Baud rate", "UART input", "Encoding", "Scrollback rows", "TV video out", "TV calibration",
+                                    "Save and close" };
     for (int i = 0; i < M_N; i++) {
-      int y = 12 + i * 10;
-      if (i == _mSel) _canvas.fillRect(0, y - 1, 240, 10, SEL);
+      int y = 12 + i * 9;
+      if (i == _mSel) _canvas.fillRect(0, y - 1, 240, 9, SEL);
       char v[20] = "";
       uint16_t vc = 0xFFFF;
       switch (i) {
@@ -1987,10 +2226,14 @@ private:
         case 5: snprintf(v, sizeof(v), "%lu", _cfgBaud ? _cfgBaud : _baud); vc = 0xFFE0; break;
         case 6: strcpy(v, _uartIn ? "ON" : "OFF"); vc = _uartIn ? 0x07E0 : 0xF800; break;
         case 7: strcpy(v, _pet ? "PETSCII" : (_utf8 ? "UTF-8" : "CP437")); vc = 0x07FF; break;
+        case 8: snprintf(v, sizeof(v), "%d (%dK)", sbLines(_sbIdx), sbLines(_sbIdx) * MAXC * 2 / 1024); vc = 0xFFE0; break;
+        case 9: { static const char *tv[5] = { "OFF", "PAL", "NTSC", "PAL 6GRAY", "NTSC 6GRAY" };
+                  strcpy(v, tv[_video <= 4 ? _video : 0]); vc = _video ? 0x07E0 : 0xF800; break; }
+        case 10: strcpy(v, "Enter"); vc = _video ? 0x07FF : 0x7BEF; break;
         default: break;
       }
-      _canvas.setTextColor(i == 8 ? (uint16_t)0xFFFF : TXT);
-      _canvas.drawString(lab[i], i == 8 ? 90 : 6, y);
+      _canvas.setTextColor(i == 11 ? (uint16_t)0xFFFF : TXT);
+      _canvas.drawString(lab[i], i == 11 ? 90 : 6, y);
       if (v[0]) {
         char b[28];
         snprintf(b, sizeof(b), i == _mSel ? "< %s >" : "%s", v);
@@ -1998,13 +2241,42 @@ private:
         _canvas.drawString(b, 234 - (int)strlen(b) * 6, y);
       }
     }
-    if (_cfgRx != _rx || _cfgTx != _tx || (_baudTouched && _cfgBaud != _baud)) {
-      _canvas.setTextColor((uint16_t)0xFFE0);
-      _canvas.drawString("Pins and baud apply on close", 6, 107);
-    }
     _canvas.fillRect(0, BAR_Y - 2, 240, BAR_H + 2, (uint16_t)0x2104);
+    if (millis() < _noteUntil) {
+      _canvas.setTextColor((uint16_t)0xFFE0);
+      _canvas.drawString(_note, 4, BAR_Y - 1);
+    } else if (_cfgRx != _rx || _cfgTx != _tx || (_baudTouched && _cfgBaud != _baud)) {
+      _canvas.setTextColor((uint16_t)0xFFE0);
+      _canvas.drawString("Pins and baud apply on close", 4, BAR_Y - 1);
+    } else {
+      _canvas.setTextColor(TXT);
+      _canvas.drawString("Up/Down item  Left/Right value  Esc exit", 4, BAR_Y - 1);
+    }
+  }
+
+  // TV calibration screen (the TV shows a frame around the 80x25 text area).
+  void drawCalib() {
+    const uint16_t TXT = 0xC618;
+    _canvas.fillSprite(TFT_BLACK);
+    _canvas.fillRect(0, 0, 240, 10, (uint16_t)0x001F);
+    _canvas.setTextColor((uint16_t)0xFFFF);
+    _canvas.drawString("TV CALIBRATION", 4, 1);
+    char b[40];
     _canvas.setTextColor(TXT);
-    _canvas.drawString("Up/Down item  Left/Right value  Esc exit", 4, BAR_Y - 1);
+    _canvas.drawString("Adjust until the frame on the TV is", 4, 16);
+    _canvas.drawString("fully visible and centred.", 4, 26);
+    _canvas.setTextColor((uint16_t)0xFFE0);
+    snprintf(b, sizeof(b), "Position X  %+d px", _vx);              _canvas.drawString(b, 4, 44);
+    snprintf(b, sizeof(b), "Position Y  %+d lines", _vy);           _canvas.drawString(b, 4, 56);
+    { uint32_t hz = cvbs::clockHz(_vw);
+      snprintf(b, sizeof(b), "Width  %d/%d  %lu.%02lu MHz (%lu us)", _vw + 1, cvbs::NCLOCKS,
+               (unsigned long)(hz / 1000000), (unsigned long)(hz / 10000 % 100), (unsigned long)(480000000UL / (hz / 1000) / 1000)); }
+    _canvas.drawString(b, 4, 68);
+    _canvas.setTextColor(TXT);
+    _canvas.drawString("; .  up / down     , /  left / right", 4, 88);
+    _canvas.drawString("-  narrower        =  wider", 4, 98);
+    _canvas.fillRect(0, BAR_Y - 2, 240, BAR_H + 2, (uint16_t)0x2104);
+    _canvas.drawString("Enter / Esc  back (saved on close)", 4, BAR_Y - 1);
   }
 
   // Phonebooks (full screen).
@@ -2077,3 +2349,6 @@ private:
     return b;
   }
 };
+
+inline bool CardputerModemSerial::s_origBoard = false;
+

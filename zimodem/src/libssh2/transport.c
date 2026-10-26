@@ -143,7 +143,10 @@ decrypt(LIBSSH2_SESSION * session, unsigned char *source,
     while(len >= blocksize) {
         if(session->remote.crypt->crypt(session, source, blocksize,
                                          &session->remote.crypt_abstract)) {
-            LIBSSH2_FREE(session, p->payload);
+            /* Zimodem/ESP32: the caller frees the payload. Freeing it here was a
+               double free when the first block failed (e.g. AES out of memory):
+               p->payload still pointed to the previous packet, already handed
+               to the packet list -> "assert failed: multi_heap_free". */
             return LIBSSH2_ERROR_DECRYPT;
         }
 
@@ -224,6 +227,7 @@ fullpacket(LIBSSH2_SESSION * session, int encrypted /* 1 or 0 */ )
                                               session->fullpacket_payload_len,
                                               &session->remote.comp_abstract);
             LIBSSH2_FREE(session, p->payload);
+            p->payload = NULL;      /* Zimodem/ESP32: no dangling pointer on error */
             if(rc)
                 return rc;
 
@@ -245,6 +249,7 @@ fullpacket(LIBSSH2_SESSION * session, int encrypted /* 1 or 0 */ )
                                  session->fullpacket_macstate);
         if(rc == LIBSSH2_ERROR_EAGAIN)
             return rc;
+        p->payload = NULL;      /* Zimodem/ESP32: owned by the packet list now */
         if(rc) {
             session->fullpacket_state = libssh2_NB_state_idle;
             return rc;
@@ -498,6 +503,7 @@ int _libssh2_transport_read(LIBSSH2_SESSION * session)
                 else {
                     if(p->payload)
                         LIBSSH2_FREE(session, p->payload);
+                    p->payload = NULL;
                     return LIBSSH2_ERROR_OUT_OF_BOUNDARY;
                 }
             }
@@ -557,6 +563,9 @@ int _libssh2_transport_read(LIBSSH2_SESSION * session)
             /* now decrypt the lot */
             rc = decrypt(session, &p->buf[p->readidx], p->wptr, numdecrypt);
             if(rc != LIBSSH2_ERROR_NONE) {
+                if(p->payload)
+                    LIBSSH2_FREE(session, p->payload);
+                p->payload = NULL;
                 p->total_num = 0;   /* no packet buffer available */
                 return rc;
             }
@@ -582,6 +591,7 @@ int _libssh2_transport_read(LIBSSH2_SESSION * session)
             else {
                 if(p->payload)
                     LIBSSH2_FREE(session, p->payload);
+                p->payload = NULL;
                 return LIBSSH2_ERROR_OUT_OF_BOUNDARY;
             }
 
