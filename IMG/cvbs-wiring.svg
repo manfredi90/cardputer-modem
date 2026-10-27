@@ -1,0 +1,103 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="620" viewBox="0 0 960 620" font-family="Helvetica, Arial, sans-serif">
+  <rect width="960" height="620" fill="#ffffff"/>
+
+  <!-- title -->
+  <text x="480" y="38" font-size="22" font-weight="bold" text-anchor="middle" fill="#111">Cardputer ADV – composite video output (CVBS)</text>
+  <text x="480" y="62" font-size="14" text-anchor="middle" fill="#555">240p PAL / NTSC · monochrome (2 pins) or 6 grey levels (3 pins)</text>
+
+  <!-- Cardputer header block -->
+  <rect x="40" y="110" width="170" height="300" rx="10" fill="#f2f4f7" stroke="#333" stroke-width="2"/>
+  <text x="125" y="135" font-size="15" font-weight="bold" text-anchor="middle" fill="#111">Cardputer ADV</text>
+  <text x="125" y="153" font-size="12" text-anchor="middle" fill="#555">expansion header</text>
+
+  <!-- pins -->
+  <g font-size="16" font-weight="bold" fill="#111">
+    <circle cx="210" cy="190" r="6" fill="#111"/><text x="190" y="196" text-anchor="end">G5</text>
+    <circle cx="210" cy="250" r="6" fill="#111"/><text x="190" y="256" text-anchor="end">G6</text>
+    <circle cx="210" cy="310" r="6" fill="#2a8a4a"/><text x="190" y="316" text-anchor="end" fill="#2a8a4a">G3</text>
+    <circle cx="210" cy="380" r="6" fill="#111"/><text x="190" y="386" text-anchor="end">GND</text>
+  </g>
+  <g font-size="11" fill="#666" text-anchor="end">
+    <text x="190" y="211">bit 2 / VIDEO</text>
+    <text x="190" y="271">bit 1 / SYNC</text>
+    <text x="190" y="331" fill="#2a8a4a">bit 0</text>
+  </g>
+
+  <!-- G5 branch -->
+  <line x1="210" y1="190" x2="300" y2="190" stroke="#222" stroke-width="2.5"/>
+  <rect x="300" y="178" width="90" height="24" rx="3" fill="#fff" stroke="#222" stroke-width="2.5"/>
+  <line x1="390" y1="190" x2="500" y2="190" stroke="#222" stroke-width="2.5"/>
+  <text x="345" y="170" font-size="15" font-weight="bold" text-anchor="middle" fill="#111">270 Ω</text>
+
+  <!-- G6 branch -->
+  <line x1="210" y1="250" x2="300" y2="250" stroke="#222" stroke-width="2.5"/>
+  <rect x="300" y="238" width="90" height="24" rx="3" fill="#fff" stroke="#222" stroke-width="2.5"/>
+  <line x1="390" y1="250" x2="500" y2="250" stroke="#222" stroke-width="2.5"/>
+  <text x="345" y="230" font-size="15" font-weight="bold" text-anchor="middle" fill="#111">560 Ω</text>
+
+  <!-- G3 branch (grey mode only) -->
+  <line x1="210" y1="310" x2="300" y2="310" stroke="#2a8a4a" stroke-width="2.5" stroke-dasharray="8 5"/>
+  <rect x="300" y="298" width="90" height="24" rx="3" fill="#fff" stroke="#2a8a4a" stroke-width="2.5" stroke-dasharray="8 5"/>
+  <line x1="390" y1="310" x2="500" y2="310" stroke="#2a8a4a" stroke-width="2.5" stroke-dasharray="8 5"/>
+  <text x="345" y="290" font-size="15" font-weight="bold" text-anchor="middle" fill="#2a8a4a">1.1 kΩ</text>
+  <text x="345" y="342" font-size="12" text-anchor="middle" fill="#2a8a4a">6 grey levels only</text>
+
+  <!-- summing node / bus -->
+  <line x1="500" y1="190" x2="500" y2="310" stroke="#222" stroke-width="2.5"/>
+  <circle cx="500" cy="190" r="5" fill="#222"/>
+  <circle cx="500" cy="250" r="5" fill="#222"/>
+  <circle cx="500" cy="310" r="5" fill="#2a8a4a"/>
+  <line x1="500" y1="250" x2="620" y2="250" stroke="#222" stroke-width="2.5"/>
+  <text x="560" y="240" font-size="12" text-anchor="middle" fill="#555">video</text>
+
+  <!-- GND wire -->
+  <line x1="210" y1="380" x2="640" y2="380" stroke="#222" stroke-width="2.5"/>
+  <line x1="640" y1="380" x2="640" y2="282" stroke="#222" stroke-width="2.5"/>
+  <text x="420" y="372" font-size="12" text-anchor="middle" fill="#555">ground</text>
+
+  <!-- RCA jack -->
+  <circle cx="640" cy="250" r="32" fill="#f7d34a" stroke="#222" stroke-width="2.5"/>
+  <circle cx="640" cy="250" r="18" fill="#ffffff" stroke="#222" stroke-width="2"/>
+  <circle cx="640" cy="250" r="6" fill="#222"/>
+  <text x="640" y="182" font-size="14" font-weight="bold" text-anchor="middle" fill="#111">RCA</text>
+  <text x="640" y="200" font-size="11" text-anchor="middle" fill="#555">centre = video</text>
+  <text x="650" y="330" font-size="11" fill="#555">shield = GND</text>
+
+  <!-- cable to TV -->
+  <line x1="672" y1="250" x2="760" y2="250" stroke="#222" stroke-width="2.5"/>
+  <text x="716" y="242" font-size="11" text-anchor="middle" fill="#555">to TV</text>
+
+  <!-- TV -->
+  <rect x="760" y="140" width="170" height="270" rx="12" fill="#eef1f5" stroke="#333" stroke-width="2"/>
+  <text x="845" y="168" font-size="15" font-weight="bold" text-anchor="middle" fill="#111">CRT TV</text>
+  <text x="845" y="186" font-size="12" text-anchor="middle" fill="#555">video in (AV / yellow)</text>
+  <rect x="775" y="205" width="140" height="190" rx="6" fill="none" stroke="#888" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="845" y="388" font-size="11" text-anchor="middle" fill="#777">inside the TV</text>
+  <line x1="760" y1="250" x2="845" y2="250" stroke="#222" stroke-width="2.5"/>
+  <line x1="845" y1="250" x2="845" y2="275" stroke="#222" stroke-width="2.5"/>
+  <rect x="833" y="275" width="24" height="60" rx="3" fill="#fff" stroke="#222" stroke-width="2.5"/>
+  <text x="866" y="310" font-size="14" font-weight="bold" fill="#111">75 Ω</text>
+  <line x1="845" y1="335" x2="845" y2="355" stroke="#222" stroke-width="2.5"/>
+  <line x1="828" y1="355" x2="862" y2="355" stroke="#222" stroke-width="2.5"/>
+  <line x1="834" y1="362" x2="856" y2="362" stroke="#222" stroke-width="2.5"/>
+  <line x1="840" y1="369" x2="850" y2="369" stroke="#222" stroke-width="2.5"/>
+
+  <!-- levels tables -->
+  <g font-size="13" fill="#111">
+    <text x="40" y="455" font-size="15" font-weight="bold">Monochrome (TV video out: PAL / NTSC)</text>
+    <text x="40" y="478">G5 + G6 only (G3 not needed). 220 Ω or 270 Ω on G5.</text>
+    <text x="40" y="500">sync  0 V   ·   black ≈ 0.30 V   ·   white ≈ 1.0 V</text>
+
+    <text x="500" y="455" font-size="15" font-weight="bold" fill="#2a8a4a">6 grey levels (PAL 6GRAY / NTSC 6GRAY)</text>
+    <text x="500" y="478">3-bit resistor DAC, codes 0–7 in steps of ≈ 0.15 V:</text>
+    <text x="500" y="500">0 sync 0 V · 2 black 0.30 V · 3–6 greys · 7 white 1.07 V</text>
+  </g>
+
+  <!-- notes -->
+  <line x1="40" y1="525" x2="920" y2="525" stroke="#ccc" stroke-width="1"/>
+  <g font-size="12.5" fill="#444">
+    <text x="40" y="550">• Do not add a 75 Ω resistor to ground: the termination is inside the TV and the values above already account for it.</text>
+    <text x="40" y="571">• 1 % resistors recommended. The 3-resistor circuit works in all modes; choose the mode in Settings (Fn+1) › TV video out.</text>
+    <text x="40" y="592">• Do not connect 5 V. Pins can be changed in CardputerCVBS.h (CARDPUTER_CVBS_PIN_VIDEO / _SYNC / _LSB).</text>
+  </g>
+</svg>
