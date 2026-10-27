@@ -64,8 +64,6 @@ Enable it in the settings menu (**TV video out**: OFF / PAL / NTSC / PAL 6GRAY /
 
 **TV calibration** (menu item below *TV video out*): the TV shows a frame around the 80x25 text area with marks every 10 columns and 5 rows; `;` `.` `,` `/` move the picture, `-` / `=` make it narrower / wider by changing the pixel clock (8.89, 9.23, 10.00, 10.91 or 11.43 MHz: only clocks with an integer divider, since fractional ones make the pixels uneven; the line timing is recomputed for each clock). The values are saved with the other settings.
 
-![alt text](IMG/IMG_20261010_113526108.jpg)
-
 Codes into 75 ohm: 0 sync (0 V), 2 black (0.30 V), 3-6 greys (0.45-0.92 V), 7 white (1.07 V). Each terminal colour becomes one of the 6 levels by brightness (two different colours always at least 2 levels apart). With 270 R on G5 the monochrome modes still work, so the same circuit serves both. The calibration screen shows a 6-step grey ramp in grey mode. G3 is used only in grey mode (`CARDPUTER_CVBS_PIN_LSB`).
 
 ![alt text](IMG/cvbs-wiring.svg)
